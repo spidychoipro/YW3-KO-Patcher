@@ -1,0 +1,24 @@
+# 빌드 산출물
+build/
+dist/
+*.spec
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# 키와 롬은 절대 올리지 않는다
+keys.txt
+aes_keys.txt
+*.cci
+*.cia
+*.3ds
+*.3dz
+*.app
+*.cxi
+
+# 패치 원본/임시 파일
+YW3S_Korean_Patch_v1.0.zip
+*.part
+YW3_KO/
+_YW3_KO_work/
