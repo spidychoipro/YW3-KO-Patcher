@@ -221,15 +221,40 @@ def make_fake_cci(work: Path, name: str, title_id: int, encrypted: bool) -> Path
     return path
 
 
+def _cia_layout(header_size: int, cert_size: int, ticket_size: int, tmd_size: int,
+                meta_size: int = 0, aligned: bool = True) -> tuple[int, int, int, int, int]:
+    """CIA 각 구간 위치. 실제 CIA는 0x40 경계에 맞춰 놓는다."""
+    def step(offset: int) -> int:
+        return _align(offset, 0x40) if aligned else offset
+
+    cert_offset = step(header_size)
+    ticket_offset = step(cert_offset + cert_size)
+    tmd_offset = step(ticket_offset + ticket_size)
+    meta_offset = step(tmd_offset + tmd_size)
+    content_offset = _align(meta_offset + meta_size, 0x40)
+    return cert_offset, ticket_offset, tmd_offset, meta_offset, content_offset
+
+
 def make_fake_cia(work: Path, name: str, title_id: int, encrypted: bool) -> Path:
-    header_size, cert, ticket, tmd, meta = 0x2020, 0xA00, 0x2A00, 0x2000, 0x3AC0
-    content = (header_size + cert + ticket + tmd + meta + 0x3F) & ~0x3F
+    header_size, cert_size, ticket_size, tmd_size, meta_size = 0x2020, 0xA00, 0x350, 0xB34, 0x3AC0
+    cert_offset, ticket_offset, tmd_offset, _meta_offset, content = _cia_layout(
+        header_size, cert_size, ticket_size, tmd_size, meta_size)
     data = bytearray(content + 0x400)
     struct.pack_into("<I", data, 0x00, header_size)
-    struct.pack_into("<I", data, 0x08, cert)
-    struct.pack_into("<I", data, 0x0C, ticket)
-    struct.pack_into("<I", data, 0x10, tmd)
-    struct.pack_into("<I", data, 0x14, meta)
+    struct.pack_into("<I", data, 0x08, cert_size)
+    struct.pack_into("<I", data, 0x0C, ticket_size)
+    struct.pack_into("<I", data, 0x10, tmd_size)
+    struct.pack_into("<I", data, 0x14, meta_size)
+    struct.pack_into("<Q", data, 0x18, 0x400)
+    data[cert_offset:cert_offset + 4] = (0x00010003).to_bytes(4, "big")
+    data[ticket_offset:ticket_offset + 4] = (0x00010004).to_bytes(4, "big")
+    data[tmd_offset:tmd_offset + 4] = (0x00010004).to_bytes(4, "big")
+    tmd_header = tmd_offset + 0x140
+    data[tmd_header + 0x4C:tmd_header + 0x54] = title_id.to_bytes(8, "big")
+    data[tmd_header + 0x9E:tmd_header + 0xA0] = (1).to_bytes(2, "big")
+    record = tmd_header + 0xC4 + 0x24 * 64
+    data[record + 0x06:record + 0x08] = (1 if encrypted else 0).to_bytes(2, "big")
+    data[record + 0x08:record + 0x10] = (0x400).to_bytes(8, "big")
     write_fake_ncch(data, content, title_id, encrypted)
     path = work / name
     path.write_bytes(data)
@@ -324,9 +349,11 @@ def make_fake_ncch(title_id: int, size: int = 0x4000) -> bytes:
 
 
 def build_fake_cia(path: Path, ncch: bytes, title_id: int, title_key: bytes,
-                   common_key: bytes, encrypt: bool) -> Path:
+                   common_key: bytes, encrypt: bool, aligned: bool = True) -> Path:
     header_size = 0x2020
-    cert = b"\x00" * 0x400
+    cert = bytearray(0x400)
+    cert[0:4] = (0x00010003).to_bytes(4, "big")
+    cert = bytes(cert)
     ticket = bytearray(0x140 + 0x210)
     ticket[0:4] = (0x00010004).to_bytes(4, "big")
     iv = title_id.to_bytes(8, "big") + b"\x00" * 8
@@ -344,7 +371,8 @@ def build_fake_cia(path: Path, ncch: bytes, title_id: int, title_key: bytes,
     tmd[record + 0x08:record + 0x10] = len(ncch).to_bytes(8, "big")
     tmd = bytes(tmd)
 
-    content_offset = _align(header_size + len(cert) + len(ticket) + len(tmd), 0x40)
+    cert_offset, ticket_offset, tmd_offset, _meta_offset, content_offset = _cia_layout(
+        header_size, len(cert), len(ticket), len(tmd), aligned=aligned)
     payload = converter.cbc_encrypt(title_key, b"\x00" * 16, ncch) if encrypt else ncch
     head = bytearray(header_size)
     struct.pack_into("<I", head, 0x00, header_size)
@@ -353,9 +381,12 @@ def build_fake_cia(path: Path, ncch: bytes, title_id: int, title_key: bytes,
     struct.pack_into("<I", head, 0x10, len(tmd))
     struct.pack_into("<I", head, 0x14, 0)
     struct.pack_into("<Q", head, 0x18, len(payload))
-    blob = bytes(head) + cert + ticket + tmd
-    blob += b"\x00" * (content_offset - len(blob))
-    path.write_bytes(blob + payload)
+    blob = bytearray(content_offset)
+    blob[0:header_size] = head
+    blob[cert_offset:cert_offset + len(cert)] = cert
+    blob[ticket_offset:ticket_offset + len(ticket)] = ticket
+    blob[tmd_offset:tmd_offset + len(tmd)] = tmd
+    path.write_bytes(bytes(blob) + payload)
     return path
 
 
@@ -423,6 +454,16 @@ def test_converter(work: Path) -> None:
     check_cci(cci_from_enc, ncch, title_id)
     assert cci_from_enc.read_bytes() == cci_from_plain.read_bytes(), "암호화 CIA 변환 결과가 다름"
     print("[ok] 암호화 CIA → CCI 변환")
+
+    legacy = build_fake_cia(work / "정렬안함.cia", ncch, title_id, title_key, common_key,
+                            True, aligned=False)
+    legacy_info = converter.read_cia(legacy, keys)
+    assert legacy_info.title_id == title_id, f"예전 CIA 타이틀: {legacy_info.title_id:016X}"
+    legacy_cci = converter.cia_to_cci(legacy, work / "정렬안함.cci", keys,
+                                      lambda m: None, lambda p: None)
+    check_cci(legacy_cci, ncch, title_id)
+    assert legacy_cci.read_bytes() == cci_from_plain.read_bytes(), "예전 CIA 변환 결과가 다름"
+    print("[ok] 0x40 정렬 안 한 예전 CIA도 읽음")
 
     ncch_file = work / "본편.app"
     ncch_file.write_bytes(ncch)
@@ -510,7 +551,7 @@ def build_crypto_cci(work: Path, name: str, plain: bytes, version: int,
         return (int.from_bytes(partition_id, "little") << 64) | (section << 56)
 
     total = 0x4000 + len(plain)
-    cci_head = converter._build_ncsd_header(plain[:0x200], len(plain), total)
+    cci_head = converter._build_ncsd_header([(plain[:0x200], len(plain))], total)
     data = bytearray(cci_head) + bytearray(plain)
     part = 0x4000
     data[part + 0x18B] = flags3
@@ -709,24 +750,24 @@ def test_prepare_pipeline(exe: Path, work: Path) -> None:
 
     for encrypt in (False, True):
         cia = build_fake_cia(work / f"pipe_{encrypt}.cia", ncch, title_id, title_key, common_key, encrypt)
-        prepared, converted = app.prepare_source(
+        prepared = app.prepare_source(
             app.BASE, cia, work, keys,
             lambda m: None, lambda s: None, lambda p: None)
-        assert converted, "CIA인데 변환으로 표시되지 않음"
-        assert prepared.read_bytes() == reference.read_bytes(), "변환 결과가 기준 CCI와 다름"
-        prepared.unlink()
+        assert prepared.converted, "CIA인데 변환으로 표시되지 않음"
+        assert prepared.path.read_bytes() == reference.read_bytes(), "변환 결과가 기준 CCI와 다름"
+        prepared.path.unlink()
     print("[ok] prepare_source: CIA → CCI (평문/암호문 모두)")
 
     seed = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
     plain_ncch = make_crypto_ncch(title_id, seed)
     enc_cci, expected_cci, cci_keys = build_crypto_cci(
         work, "pipe_enc.cci", plain_ncch, 0, 0x0A, seed)
-    prepared, converted = app.prepare_source(
+    prepared = app.prepare_source(
         app.BASE, enc_cci, work, cci_keys,
         lambda m: None, lambda s: None, lambda p: None)
-    assert converted, "암호화 CCI인데 변환으로 표시되지 않음"
-    assert prepared.read_bytes() == expected_cci, "암호화 CCI 복호화 결과가 다름"
-    prepared.unlink()
+    assert prepared.converted, "암호화 CCI인데 변환으로 표시되지 않음"
+    assert prepared.path.read_bytes() == expected_cci, "암호화 CCI 복호화 결과가 다름"
+    prepared.path.unlink()
     print("[ok] prepare_source: 암호화 CCI → 복호화 CCI")
 
     target = work / "pipe_target.bin"
@@ -754,6 +795,163 @@ def test_prepare_pipeline(exe: Path, work: Path) -> None:
     print("[ok] 변환본 → 패치 → 지문 검증")
 
 
+def build_multi_cia(path: Path, contents: list[bytes], title_id: int, title_key: bytes,
+                    common_key: bytes, encrypt: bool) -> Path:
+    """본편/설명서/DLP 내용을 여러 개 담은 CIA를 만든다(카트리지 덤프 흉내)."""
+    header_size = 0x2020
+    cert = bytearray(0x400)
+    cert[0:4] = (0x00010003).to_bytes(4, "big")
+    cert = bytes(cert)
+    ticket = bytearray(0x140 + 0x210)
+    ticket[0:4] = (0x00010004).to_bytes(4, "big")
+    iv = title_id.to_bytes(8, "big") + b"\x00" * 8
+    ticket[0x140 + 0x7F:0x140 + 0x8F] = converter.cbc_encrypt(common_key, iv, title_key)
+    ticket[0x140 + 0x9C:0x140 + 0xA4] = title_id.to_bytes(8, "big")
+    ticket = bytes(ticket)
+
+    records = 0x30 * len(contents)
+    tmd = bytearray(0x140 + 0xC4 + 0x24 * 64 + records)
+    tmd[0:4] = (0x00010004).to_bytes(4, "big")
+    tmd[0x140 + 0x4C:0x140 + 0x54] = title_id.to_bytes(8, "big")
+    tmd[0x140 + 0x9E:0x140 + 0xA0] = len(contents).to_bytes(2, "big")
+    base = 0x140 + 0xC4 + 0x24 * 64
+    for index, ncch in enumerate(contents):
+        record = base + index * 0x30
+        tmd[record + 0x00:record + 0x04] = index.to_bytes(4, "big")
+        tmd[record + 0x04:record + 0x06] = index.to_bytes(2, "big")
+        tmd[record + 0x06:record + 0x08] = (1 if encrypt else 0).to_bytes(2, "big")
+        tmd[record + 0x08:record + 0x10] = len(ncch).to_bytes(8, "big")
+    tmd = bytes(tmd)
+
+    cert_offset, ticket_offset, tmd_offset, _meta_offset, content_offset = _cia_layout(
+        header_size, len(cert), len(ticket), len(tmd))
+    payload = bytearray()
+    for index, ncch in enumerate(contents):
+        if encrypt:
+            payload += converter.cbc_encrypt(title_key, converter._content_iv(index), ncch)
+        else:
+            payload += ncch
+    head = bytearray(header_size)
+    struct.pack_into("<I", head, 0x00, header_size)
+    struct.pack_into("<I", head, 0x08, len(cert))
+    struct.pack_into("<I", head, 0x0C, len(ticket))
+    struct.pack_into("<I", head, 0x10, len(tmd))
+    struct.pack_into("<I", head, 0x14, 0)
+    struct.pack_into("<Q", head, 0x18, len(payload))
+    blob = bytearray(content_offset)
+    blob[0:header_size] = head
+    blob[cert_offset:cert_offset + len(cert)] = cert
+    blob[ticket_offset:ticket_offset + len(ticket)] = ticket
+    blob[tmd_offset:tmd_offset + len(tmd)] = tmd
+    path.write_bytes(bytes(blob) + bytes(payload))
+    return path
+
+
+def test_multi_content(work: Path) -> None:
+    """카트리지처럼 본편·설명서·DLP를 담은 CIA가 CCI 파티션 3개로 묶이는지 확인한다."""
+    title_key = bytes.fromhex("00112233445566778899aabbccddeeff")
+    common_key = bytes.fromhex("ffeeddccbbaa99887766554433221100")
+    title_id = app.YW3_BASE_TITLE
+    keys = converter.Keys(common=common_key)
+
+    contents = [
+        make_fake_ncch(title_id, 0x8000),
+        make_fake_ncch(title_id, 0x4000),
+        make_fake_ncch(title_id, 0x2000),
+    ]
+    for encrypt in (False, True):
+        cia = build_multi_cia(work / f"multi_{encrypt}.cia", contents, title_id,
+                              title_key, common_key, encrypt)
+        cci = converter.cia_to_cci(cia, work / f"multi_{encrypt}.cci", keys, lambda m: None)
+        data = cci.read_bytes()
+        partitions = converter.read_ncsd(cci)
+        assert len(partitions) == 3, f"파티션 {len(partitions)}개"
+        assert [item.size for item in partitions] == [0x8000, 0x4000, 0x2000], partitions
+        assert int.from_bytes(data[0x104:0x108], "little") * 0x200 == len(data), "미디어 크기 필드"
+        for partition, plain in zip(partitions, contents):
+            expected = bytearray(plain)
+            expected[0x18F] |= 0x04
+            part = data[partition.offset:partition.offset + partition.size]
+            assert part == bytes(expected), f"파티션 {partition.index} 내용 불일치"
+        assert int.from_bytes(data[0x190:0x198], "big") == title_id, "파티션 0 ID"
+        assert int.from_bytes(data[0x1A0:0x1A8], "big") == title_id, "파티션 2 ID"
+        print(f"[ok] 다중 내용 CIA({len(contents)}개) → CCI, 암호화={encrypt}")
+
+    cci = work / "multi_False.cci"
+    packed = cci.stat().st_size
+    padded = converter.cia_to_cci(
+        work / "multi_False.cia", work / "multi_pad.cci", keys, lambda m: None,
+        min_size=packed + 0x1000)
+    assert padded.stat().st_size == _align(packed + 0x1000, 0x200), padded.stat().st_size
+    assert converter.read_ncsd(padded)[-1].offset + converter.read_ncsd(padded)[-1].size <= packed
+    print("[ok] 모자란 CCI는 카트리지 크기까지 0으로 채움")
+
+
+def test_window_verify(exe: Path, work: Path) -> None:
+    """변환본 패치 검사: 헤더만 다르면 통과, 내용이 다르면 거부."""
+    source = work / "win_ref.bin"
+    data = bytearray(os.urandom(0x4000 + 0xC00000))  # 12MB + 헤더
+    data[0x1100:0x1200] = os.urandom(0x100)
+    source.write_bytes(bytes(data))
+    target = bytearray(data)
+    target[0x2000:0x2010] = b"korean patch!!! "
+    target[0x900000:0x900010] = b"deep content!!!!"
+    target_path = work / "win_target.bin"
+    target_path.write_bytes(bytes(target))
+
+    diff = work / "win.xdelta"
+    app.subprocess.run([str(exe), "-e", "-f", "-s", str(source), str(target_path), str(diff)],
+                       capture_output=True, check=True)
+    windows = converter.read_vcdiff_windows(diff)
+    assert sum(length for _offset, length, _checksum in windows) == len(target), "창 크기 합"
+    assert len(windows) == 2, f"창 {len(windows)}개"
+
+    good = work / "win_good.bin"
+    app.subprocess.run([str(exe), "-d", "-f", "-s", str(source), str(diff), str(good)],
+                       capture_output=True, check=True)
+    digest, bad = app._check_windows(good, windows, None)
+    assert not bad, f"정상 원본인데 창이 다름: {bad}"
+    assert digest == hashlib.sha256(bytes(target)).hexdigest()
+
+    role = app.Role(
+        key="base", label="본편", patch_name=diff.name, patch_size=diff.stat().st_size,
+        patch_sha256=sha256_bytes(diff.read_bytes()), result_name="win_out.bin",
+        result_size=len(target), result_sha256=sha256_bytes(bytes(target)),
+    )
+    out_dir = work / "win_out"
+    out_dir.mkdir()
+
+    header_diff = bytearray(data)
+    header_diff[0x1100:0x1110] = b"DIFFERENTHEADER!"
+    header_source = work / "win_header.bin"
+    header_source.write_bytes(bytes(header_diff))
+    report: dict = {}
+    kept = app.apply_patch(
+        role, header_source, out_dir, exe, diff, True, True,
+        lambda m: None, lambda p: None, lambda s: None,
+        strict=False, report=report, allow_header=True)
+    assert kept.is_file() and report.get("verified") is False, "헤더 차이를 통과시키지 못함"
+    assert report.get("windows_ok") is False, "창 검사 기록이 없음"
+    kept.unlink()
+    print("[ok] 변환본 패치: 헤더만 다르면 통과")
+
+    content_diff = bytearray(data)
+    content_diff[0xA00000] ^= 0xFF
+    content_source = work / "win_content.bin"
+    content_source.write_bytes(bytes(content_diff))
+    try:
+        app.apply_patch(
+            role, content_source, out_dir, exe, diff, True, True,
+            lambda m: None, lambda p: None, lambda s: None,
+            strict=False, allow_header=True)
+    except app.PatchError as exc:
+        assert "달라서" in str(exc), str(exc)
+        print("[ok] 변환본 패치: 내용이 다르면 거부")
+    else:
+        raise AssertionError("내용이 다른데 패치를 통과시켰다")
+    assert not (out_dir / "win_out.bin.part").exists(), "실패 후 임시 파일이 남음"
+
+
 def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="yw3ko_test_"))
     os.environ[app.CACHE_ENV] = str(work / "cache")
@@ -769,6 +967,8 @@ def main() -> int:
         test_cci_decrypt(work)
         test_convert_levels(work)
         test_prepare_pipeline(exe, work)
+        test_multi_content(work)
+        test_window_verify(exe, work)
         test_ui_states(work)
         test_gui()
         test_gui_flow(exe, work)

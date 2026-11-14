@@ -25,6 +25,7 @@ import time
 import tkinter as tk
 import urllib.request
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -32,7 +33,7 @@ from tkinter import filedialog, messagebox, ttk
 import yw3convert as converter
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -61,6 +62,7 @@ class Role:
     result_name: str
     result_size: int
     result_sha256: str
+    source_size: int = 0  # 공식 원본 크기(변환본이 모자랄 때 채워 넣는다)
 
 
 BASE = Role(
@@ -72,6 +74,7 @@ BASE = Role(
     result_name="YW3_Sukiyaki_KO_base.cci",
     result_size=3278712832,
     result_sha256="905b326fd6949054ac64dc5db9bbb6ef90510c5da824fc197dc8a8a69f0cdb34",
+    source_size=3270860800,
 )
 UPDATE = Role(
     key="update",
@@ -130,14 +133,12 @@ def inspect_rom(path: Path) -> RomInfo:
         found = _ncch_header(head, media_units * 0x200)
     elif head[:4] == b"\x20\x20\x00\x00":
         kind = "cia"
-        offset = (
-            int.from_bytes(head[0x00:0x04], "little")
-            + int.from_bytes(head[0x08:0x0C], "little")
-            + int.from_bytes(head[0x0C:0x10], "little")
-            + int.from_bytes(head[0x10:0x14], "little")
-            + int.from_bytes(head[0x14:0x18], "little")
-        )
-        offset = (offset + 0x3F) & ~0x3F
+        header_size = int.from_bytes(head[0x00:0x04], "little")
+        cert_offset = (header_size + 0x3F) & ~0x3F
+        ticket_offset = (cert_offset + int.from_bytes(head[0x08:0x0C], "little") + 0x3F) & ~0x3F
+        tmd_offset = (ticket_offset + int.from_bytes(head[0x0C:0x10], "little") + 0x3F) & ~0x3F
+        meta_offset = (tmd_offset + int.from_bytes(head[0x10:0x14], "little") + 0x3F) & ~0x3F
+        offset = (meta_offset + int.from_bytes(head[0x14:0x18], "little") + 0x3F) & ~0x3F
         found = _ncch_header(head, offset)
         for delta in range(0x40, 0x400, 0x40):  # 정렬이 다를 때를 위한 여유 탐색
             if found:
@@ -369,15 +370,49 @@ def ensure_patch(role: Role, log, progress=None) -> Path:
     raise PatchError("패치 준비 실패")
 
 
+def _check_windows(part: Path, windows, progress) -> tuple[str, list[tuple[int, int]]]:
+    """패치 결과를 창 단위로 확인한다. SHA-256도 같은 읽기에서 계산한다."""
+    digest = hashlib.sha256()
+    bad: list[tuple[int, int]] = []
+    total = sum(length for _offset, length, _checksum in windows)
+    done = 0
+    with part.open("rb") as handle:
+        for offset, length, checksum in windows:
+            data = handle.read(length)
+            if len(data) != length:
+                raise PatchError("패치 결과 파일이 예상보다 짧습니다.")
+            digest.update(data)
+            done += length
+            if checksum is not None and (zlib.adler32(data) & 0xFFFFFFFF) != checksum:
+                bad.append((offset, length))
+            if progress and total:
+                progress(80 + 20 * done / total)
+    return digest.hexdigest().lower(), bad
+
+
+def _explain_mismatch(role: Role, bad: list[tuple[int, int]]) -> str:
+    ranges = ", ".join(f"0x{offset:X}" for offset, _length in bad[:4])
+    return (
+        f"{role.label} 패치 결과가 공식 원본과 달라서 저장하지 않았습니다.\n\n"
+        f"크기는 맞지만 내용이 다른 구간이 있어요: {ranges}\n\n"
+        "요괴워치3 스키야키 일본판 v0이 맞는지 확인해 주세요. "
+        "본편 자리에 업데이트를 넣었거나, 다른 지역·버전 파일이면 이렇게 됩니다."
+    )
+
+
 def apply_patch(role: Role, source: Path, out_dir: Path, exe: Path, patch: Path, overwrite: bool,
                 verify: bool, log, progress, status, strict: bool | None = None,
-                report: dict | None = None) -> Path:
+                report: dict | None = None, allow_header: bool = False,
+                padded_from: int | None = None) -> Path:
     """xdelta3로 패치 하나를 적용하고 결과 경로를 돌려준다.
 
-    strict=False면 결과 지문이 공식 값과 달라도 파일을 남긴다(변환본으로 패치한 경우).
+    strict=False면 변환본으로 패치한 것으로 보고 검사를 조금 풀어준다.
+    xdelta의 창 지문 검사를 끄고(-n -a) 직접 창 단위로 확인한다.
+    allow_header면 CCI 헤더(0x0~0x4000)가 달라도 넘어간다.
     """
     if strict is None:
         strict = verify
+    tolerant = not strict
     final = out_dir / role.result_name
     if final.exists() and not overwrite:
         raise PatchError(f"결과 파일이 이미 있습니다: {final}")
@@ -387,7 +422,10 @@ def apply_patch(role: Role, source: Path, out_dir: Path, exe: Path, patch: Path,
 
     status(f"{role.label}에 한글을 입히는 중...")
     log(f"[{role.label}] {source.name} → {role.result_name}")
-    command = [str(exe), "-d", "-f", "-s", str(source), str(patch), str(part)]
+    command = [str(exe), "-d", "-f"]
+    if tolerant:
+        command += ["-n", "-a"]
+    command += ["-s", str(source), str(patch), str(part)]
     started = time.monotonic()
     proc = subprocess.Popen(
         command,
@@ -414,8 +452,40 @@ def apply_patch(role: Role, source: Path, out_dir: Path, exe: Path, patch: Path,
 
         if verify:
             status("결과 확인 중...")
-            log(f"[{role.label}] SHA-256 검증 중...")
-            got = sha256_file(part, lambda done, total: progress(80 + done * 20 / max(total, 1)))
+            windows = converter.read_vcdiff_windows(patch) if tolerant else []
+            if windows:
+                log(f"[{role.label}] 패치 창 {len(windows)}개로 결과를 확인합니다")
+                if part.stat().st_size != role.result_size:
+                    raise PatchError(
+                        f"{role.label} 패치 결과 크기가 다릅니다.\n"
+                        f"계산값: {part.stat().st_size:,}\n기대값: {role.result_size:,}\n"
+                        "원본 파일이 지원 버전인지 확인해 주세요."
+                    )
+                if sum(length for _offset, length, _checksum in windows) != role.result_size:
+                    raise PatchError(f"{role.label} 패치 파일의 창 크기 합이 결과 크기와 다릅니다.")
+                got, bad = _check_windows(part, windows, progress)
+                hard: list[tuple[int, int]] = []
+                header_bad = padded_bad = 0
+                for offset, length in bad:
+                    if allow_header and offset < converter.CCI_HEADER_SIZE:
+                        header_bad += 1
+                    elif padded_from is not None and offset >= padded_from:
+                        padded_bad += 1
+                    else:
+                        hard.append((offset, length))
+                if hard:
+                    raise PatchError(_explain_mismatch(role, hard))
+                if header_bad:
+                    log(f"[{role.label}] 헤더가 원본 카트리지와 달라요(내용과 상관없는 부분)")
+                if padded_bad:
+                    log(f"[{role.label}] 원본에 없던 설명서/DLP 구간은 빈 채로 둡니다")
+                if report is not None:
+                    report["windows"] = len(windows)
+                    report["windows_ok"] = not bad
+            else:
+                log(f"[{role.label}] SHA-256 검증 중...")
+                got = sha256_file(part, lambda done, total: progress(80 + done * 20 / max(total, 1)))
+
             if got != role.result_sha256 and strict:
                 raise PatchError(
                     f"{role.label} 결과 지문이 공식 배포본과 다릅니다.\n"
@@ -430,7 +500,7 @@ def apply_patch(role: Role, source: Path, out_dir: Path, exe: Path, patch: Path,
                 if report is not None:
                     report["verified"] = False
                 log(f"[{role.label}] 지문이 공식 값과 달라요: {got}")
-                log(f"[{role.label}] 변환본으로 패치해서 헤더가 달라진 경우예요. 파일은 저장합니다.")
+                log(f"[{role.label}] 변환본으로 패치해서 헤더만 달라진 경우예요. 파일은 저장합니다.")
         progress(100)
         os.replace(part, final)
     except Exception:
@@ -441,43 +511,68 @@ def apply_patch(role: Role, source: Path, out_dir: Path, exe: Path, patch: Path,
     return final
 
 
-def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys, log, status,
-                   progress) -> tuple[Path, bool]:
-    """패치에 쓸 파일을 준비한다. 필요하면 복호화·CCI 변환까지 한다.
+@dataclass(frozen=True)
+class PreparedSource:
+    """패치에 넣을 원본. 변환본이면 검사에서 봐줄 범위도 같이 알려준다."""
 
-    돌려주는 값은 (준비된 파일, 변환했는지 여부).
-    """
+    path: Path
+    converted: bool
+    allow_header: bool = False
+    padded_from: int | None = None
+
+
+def _packed_end(path: Path) -> int:
+    """만들어 낸 CCI에서 실제 내용이 끝나는 위치. 그 뒤는 0으로 채운 구간이다."""
+    try:
+        partitions = converter.read_ncsd(path)
+    except converter.ConvertError:
+        return path.stat().st_size
+    return max((item.offset + item.size for item in partitions), default=path.stat().st_size)
+
+
+def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys, log, status,
+                   progress) -> PreparedSource:
+    """패치에 쓸 파일을 준비한다. 필요하면 복호화·CCI 변환까지 한다."""
     info = inspect_rom(path)
     try:
         if role.key == "base":
             if info.kind == "cia":
                 status("본편 CIA를 CCI로 바꾸는 중...")
                 log(f"[본편] CIA를 CCI로 변환합니다 ({human_size(path.stat().st_size)})")
-                target = work_dir / "base_from_cia.cci"
-                return converter.cia_to_cci(path, target, keys, log, progress), True
+                target = converter.cia_to_cci(
+                    path, work_dir / "base_from_cia.cci", keys, log, progress,
+                    min_size=role.source_size)
+                real_end = _packed_end(target)
+                padded = real_end if real_end < target.stat().st_size else None
+                return PreparedSource(target, True, allow_header=True, padded_from=padded)
             if info.kind == "ncch":
                 if info.encrypted:
                     status("본편 NCCH 암호를 푸는 중...")
                     log("[본편] NCCH를 CCI로 감싼 뒤 암호를 풉니다")
                     wrapped = converter.ncch_to_cci(
                         path, work_dir / "base_from_ncch.cci", log, progress)
-                    return converter.decrypt_cci(
-                        wrapped, work_dir / "base_decrypted.cci", keys, log, progress), True
+                    result = converter.decrypt_cci(
+                        wrapped, work_dir / "base_decrypted.cci", keys, log, progress)
+                    return PreparedSource(result, True, allow_header=True)
                 status("본편 NCCH를 CCI로 감싸는 중...")
                 log("[본편] NCCH를 CCI로 감쌉니다")
-                return converter.ncch_to_cci(path, work_dir / "base_from_ncch.cci", log, progress), True
+                result = converter.ncch_to_cci(path, work_dir / "base_from_ncch.cci", log, progress)
+                return PreparedSource(result, True, allow_header=True)
             if info.encrypted:
                 status("본편 CCI 암호를 푸는 중...")
                 log(f"[본편] 암호화된 CCI의 NCCH 암호를 풉니다 ({human_size(path.stat().st_size)})")
-                return converter.decrypt_cci(
-                    path, work_dir / "base_decrypted.cci", keys, log, progress), True
+                result = converter.decrypt_cci(
+                    path, work_dir / "base_decrypted.cci", keys, log, progress)
+                return PreparedSource(result, True, allow_header=True)
         elif info.kind == "cia" and info.encrypted:
             status("업데이트 암호를 푸는 중...")
             log("[업데이트] 암호화된 CIA를 복호화합니다")
-            return converter.decrypt_cia(path, work_dir / "update_decrypted.cia", keys, progress), True
+            result = converter.decrypt_cia(
+                path, work_dir / "update_decrypted.cia", keys, progress)
+            return PreparedSource(result, True)
     except converter.ConvertError as exc:
         raise PatchError(str(exc)) from exc
-    return path, False
+    return PreparedSource(path, False)
 
 
 def _explain_failure(role: Role, returncode: int, raw: bytes) -> str:
@@ -488,10 +583,9 @@ def _explain_failure(role: Role, returncode: int, raw: bytes) -> str:
             f"{role.label} 원본이 패치 대상 버전과 다릅니다.\n\n"
             "xdelta3 메시지:\n"
             f"{text}\n\n"
-            "일본판 요괴워치3 스키야키의 복호화된 원본인지 확인해 주세요.\n"
-            "본편은 복호화 CCI(v0), 업데이트는 복호화 CIA(Update 4.0)여야 합니다.\n"
-            "암호화된 파일을 이 앱에서 풀었다면 콘솔에서 직접 복호화한 파일과 "
-            "바이트가 조금 다를 수 있어요."
+            "일본판 요괴워치3 스키야키 v0인지 확인해 주세요. "
+            "본편은 복호화 CCI나 CIA(hshop 본편 포함), 업데이트는 Update 4.0 CIA여야 합니다. "
+            "다른 지역판이나 다른 버전이면 크기·내용이 달라서 거부됩니다."
         )
     return f"xdelta3 실행에 실패했습니다 (종료 코드 {returncode}).\n\n{text}"
 
@@ -785,23 +879,27 @@ class PatcherApp(tk.Tk):
             results: list[Path] = []
             notes: list[str] = []
             for role, source, prep_low, prep_high, low, high in plans:
-                prepared, converted = prepare_source(
+                prepared = prepare_source(
                     role, source, work_dir, keys, self._log, self._status,
                     lambda percent, a=prep_low, b=prep_high: self._progress(a + (b - a) * percent / 100.0),
                 )
                 report: dict = {}
                 results.append(apply_patch(
-                    role, prepared, out_dir, exe, patches[role.key], True, True,
+                    role, prepared.path, out_dir, exe, patches[role.key], True, True,
                     self._log,
                     lambda percent, a=low, b=high: self._progress(a + (b - a) * percent / 100.0),
                     self._status,
-                    strict=not converted,
+                    strict=not prepared.converted,
                     report=report,
+                    allow_header=prepared.allow_header,
+                    padded_from=prepared.padded_from,
                 ))
-                if converted:
-                    prepared.unlink(missing_ok=True)
+                if prepared.converted:
+                    prepared.path.unlink(missing_ok=True)
                 if report.get("verified") is False:
-                    notes.append(f"{role.label}: 변환본으로 패치해서 {role.result_name}의 지문이 공식 값과 달라요.")
+                    notes.append(
+                        f"{role.label}: 원본이 공식 CCI가 아니라 헤더가 조금 달라요. "
+                        "게임 내용은 확인했으니 그대로 쓰면 됩니다.")
             self._status("마무리 확인 중...")
             self._emit("done", True, results, out_dir, notes)
         except PatchError as exc:

@@ -850,10 +850,18 @@ def decrypt_title_key(encrypted: bytes, title_id: int, common_key: bytes) -> byt
     return cbc_decrypt(common_key, iv, encrypted[:16])[:16]
 
 
+def _is_sig_type(value: int) -> bool:
+    return 0x00010000 <= value <= 0x00010005
+
+
 def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
-    """CIA 헤더/티켓/TMD를 읽는다. 암호화 여부와 타이틀 키까지 계산한다."""
+    """CIA 헤더/티켓/TMD를 읽는다. 암호화 여부와 타이틀 키까지 계산한다.
+
+    CIA는 각 구간(인증서, 티켓, TMD, 메타, 내용)이 0x40 경계에서 시작한다.
+    헤더 크기가 보통 0x2020이라 그냥 더하면 0x20씩 밀리므로 반드시 맞춰 준다.
+    """
     with path.open("rb") as handle:
-        head = handle.read(0x2020)
+        head = handle.read(0x2040)
         if len(head) < 0x2020 or head[:4] != b"\x20\x20\x00\x00":
             raise ConvertError("CIA 헤더가 아닙니다.")
         header_size = int.from_bytes(head[0x00:0x04], "little")
@@ -861,8 +869,24 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
         ticket_size = int.from_bytes(head[0x0C:0x10], "little")
         tmd_size = int.from_bytes(head[0x10:0x14], "little")
 
-        ticket_offset = header_size + cert_size
-        tmd_offset = ticket_offset + ticket_size
+        meta_size = int.from_bytes(head[0x14:0x18], "little")
+
+        def probe(offset: int) -> int:
+            handle.seek(offset)
+            found = handle.read(4)
+            return int.from_bytes(found, "big") if len(found) == 4 else -1
+
+        def place(offset: int) -> int:
+            """기본은 0x40 정렬. 정렬 안 한 예전 CIA면 그냥 붙여 쓴 위치가 맞다."""
+            aligned = _align(offset, 0x40)
+            if aligned != offset and not _is_sig_type(probe(aligned)) and _is_sig_type(probe(offset)):
+                return offset
+            return aligned
+
+        cert_offset = place(header_size)
+        ticket_offset = place(cert_offset + cert_size)
+        tmd_offset = place(ticket_offset + ticket_size)
+        meta_offset = _align(tmd_offset + tmd_size, 0x40)
         handle.seek(ticket_offset)
         ticket = handle.read(ticket_size)
         handle.seek(tmd_offset)
@@ -874,11 +898,13 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
     tmd_sig = _sig_data_size(int.from_bytes(tmd[0:4], "big"))
     tmd_header = tmd[tmd_sig:]
     title_id = int.from_bytes(tmd_header[0x4C:0x54], "big")
+    if title_id >> 48 != 0x0004:  # CTR 타이틀 ID는 항상 0x0004로 시작한다
+        raise ConvertError("CIA 안의 TMD에서 타이틀 ID를 읽지 못했습니다. 파일이 손상됐을 수 있어요.")
     title_version = int.from_bytes(tmd_header[0x9C:0x9E], "big")
     content_count = int.from_bytes(tmd_header[0x9E:0xA0], "big")
 
     records = tmd[tmd_sig + 0xC4 + 0x24 * 64:]
-    content_area = _align(tmd_offset + tmd_size, 0x40)
+    content_area = _align(meta_offset + meta_size, 0x40)
     contents: list[CiaContent] = []
     offset = content_area
     for index in range(content_count):
@@ -1000,25 +1026,47 @@ def decrypt_cia(src: Path, dst: Path, keys: Keys, progress=None) -> Path:
 # --------------------------------------------------------- CIA/NCCH -> CCI
 
 
-def _build_ncsd_header(ncch_head: bytes, ncch_size: int, total_size: int) -> bytes:
-    """NCCH 헤더를 보고 NCSD(CCI) 헤더 0x4000바이트를 만든다."""
+def _build_ncsd_header(parts: list[tuple[bytes, int]], total_size: int | None = None) -> bytes:
+    """NCCH 헤더 목록(헤더, 파티션 크기)으로 카트리지 같은 NCSD(CCI) 헤더를 만든다.
+
+    파티션 0은 본편, 1은 설명서, 2는 다운로드 플레이 자식이다. 카트리지 덤프와
+    같은 모양으로 맞춰 두면 에뮬레이터와 3DS 쪽에서 그냥 CCI로 인식한다.
+    """
+    if not parts:
+        raise ConvertError("CCI로 묶을 NCCH가 없습니다.")
+    packed = sum(size for _head, size in parts)
+    total = total_size or (CCI_HEADER_SIZE + packed)
+
     header = bytearray(CCI_HEADER_SIZE)
+    first = parts[0][0]
     header[0x100:0x104] = b"NCSD"
-    header[0x104:0x108] = (total_size // MEDIA_UNIT).to_bytes(4, "little")
-    header[0x108:0x110] = ncch_head[0x108:0x110]  # 미디어 ID 자리에 파티션 ID(타이틀 ID)
+    header[0x104:0x108] = (total // MEDIA_UNIT).to_bytes(4, "little")
+    header[0x108:0x110] = first[0x108:0x110]  # 미디어 ID = 본편 파티션 ID
     header[0x110:0x118] = (0).to_bytes(8, "big")  # 파티션 FS 종류: 일반
     header[0x118:0x120] = b"\x00" * 8  # 파티션별 암호화 종류: 전부 없음
-    start_unit = CCI_HEADER_SIZE // MEDIA_UNIT
-    size_unit = _align(ncch_size, MEDIA_UNIT) // MEDIA_UNIT
-    header[0x120:0x124] = start_unit.to_bytes(4, "little")
-    header[0x124:0x128] = size_unit.to_bytes(4, "little")
-    header[0x160:0x180] = ncch_head[0x160:0x180]  # 확장 헤더 해시
+
+    offset = CCI_HEADER_SIZE
+    for index, (head, size) in enumerate(parts[:NCSD_PARTITIONS]):
+        header[0x120 + index * 8:0x124 + index * 8] = \
+            (offset // MEDIA_UNIT).to_bytes(4, "little")
+        header[0x124 + index * 8:0x128 + index * 8] = \
+            (size // MEDIA_UNIT).to_bytes(4, "little")
+        header[0x190 + index * 8:0x198 + index * 8] = head[0x108:0x110]
+        offset += size
+
+    header[0x160:0x180] = first[0x160:0x180]  # 확장 헤더 해시
     header[0x180:0x184] = (0).to_bytes(4, "little")  # 추가 헤더 없음
     header[0x184:0x188] = (0).to_bytes(4, "little")  # 섹터 0 오프셋
     header[0x18C] = 1  # 미디어 플랫폼: CTR
     header[0x18D] = 1  # 미디어 종류: 카드1
-    header[0x190:0x198] = ncch_head[0x118:0x120]  # 파티션 0 타이틀 ID
-    header[0x310:0x312] = ncch_head[0x112:0x114]  # 카드 정보 헤더의 타이틀 버전
+    header[0x200:0x204] = b"\xff\xff\xff\xff"  # 카드1은 항상 0xFFFFFFFF
+    header[0x204:0x208] = (1).to_bytes(4, "little")  # 카드 정보 있음
+    header[0x300:0x304] = total.to_bytes(4, "little")  # 카트리지 채운 크기
+    header[0x310:0x312] = first[0x112:0x114]  # 타이틀 버전
+
+    title_id = int.from_bytes(first[0x118:0x120], "big")
+    header[0x1000:0x1008] = title_id.to_bytes(8, "little")  # 시드 자리
+    header[0x1100:0x1200] = first[0x100:0x200]  # NCCH 헤더 사본(서명 제외)
     return bytes(header)
 
 
@@ -1030,59 +1078,104 @@ def _patch_nocrypto(ncch_head: bytes) -> bytes:
     return bytes(fixed)
 
 
-def cia_to_cci(src: Path, dst: Path, keys: Keys, log, progress=None) -> Path:
-    """CIA의 본편 내용을 꺼내 CCI로 다시 묶는다. 암호화되어 있으면 풀면서 쓴다."""
+def _cia_ncch_size(plain_head: bytes, content_size: int) -> int:
+    """CIA 내용 하나가 CCI에서 차지할 크기를 정한다."""
+    declared = int.from_bytes(plain_head[0x104:0x108], "little") * MEDIA_UNIT
+    return max(declared, _align(content_size, MEDIA_UNIT), 0x400)
+
+
+def cia_to_cci(src: Path, dst: Path, keys: Keys, log, progress=None,
+               min_size: int = 0) -> Path:
+    """CIA의 모든 내용(본편·설명서·DLP)을 꺼내 카트리지처럼 CCI로 묶는다.
+
+    min_size는 카트리지 원본 크기다. 설명서나 DLP 내용이 빠진 CIA라도
+    xdelta 패치가 원본 크기를 요구하므로 뒤를 0으로 채워 크기를 맞춘다.
+    """
     info = read_cia(src, keys)
-    program = info.program
-    if program is None:
-        raise ConvertError("CIA 안에 본편 내용이 없습니다.")
-    if program.encrypted and not info.title_key:
+    if not info.contents:
+        raise ConvertError("CIA 안에 내용이 없습니다.")
+    if info.needs_key and not info.title_key:
         raise ConvertError(_need_key_message())
 
+    entries: list[tuple[CiaContent, bytes, bytes, int]] = []
     with src.open("rb") as source:
-        source.seek(program.offset)
-        raw_head = source.read(0x400)
-        if len(raw_head) < 0x400:
-            raise ConvertError("CIA 내용이 잘렸습니다.")
-        iv = _content_iv(program.index)
-        plain_head = (cbc_decrypt(info.title_key, iv, raw_head)
-                      if program.encrypted else raw_head)
-        if plain_head[0x100:0x104] != b"NCCH":
-            raise ConvertError("CIA 안에서 NCCH 헤더를 찾지 못했습니다.")
+        for content in sorted(info.contents, key=lambda item: item.index)[:NCSD_PARTITIONS]:
+            source.seek(content.offset)
+            raw_head = source.read(0x400)
+            if len(raw_head) < 0x400:
+                raise ConvertError("CIA 내용이 잘렸습니다.")
+            plain_head = (cbc_decrypt(info.title_key, _content_iv(content.index), raw_head)
+                          if content.encrypted else raw_head)
+            if plain_head[0x100:0x104] != b"NCCH":
+                raise ConvertError(
+                    f"CIA 내용 {content.index}에서 NCCH 헤더를 찾지 못했습니다. "
+                    "키가 맞는지 확인해 주세요.")
+            entries.append((content, _patch_nocrypto(plain_head), raw_head,
+                            _cia_ncch_size(plain_head, content.size)))
 
-        declared = int.from_bytes(plain_head[0x104:0x108], "little") * MEDIA_UNIT
-        ncch_size = max(declared, _align(program.size, MEDIA_UNIT))
-        total = CCI_HEADER_SIZE + ncch_size
-        header = _build_ncsd_header(_patch_nocrypto(plain_head), ncch_size, total)
+        packed = sum(size for _content, _head, _raw, size in entries)
+        total = CCI_HEADER_SIZE + packed
+        wanted = _align(min_size, MEDIA_UNIT) if min_size else 0
+        # 설명서/DLP가 빠진 CIA면 카트리지 원본 크기까지 0으로 채운다.
+        # 차이가 너무 크면 애초에 다른 게임이라 채워도 패치가 안 되니 그냥 둔다.
+        if wanted and 0 < wanted - total <= 0x10000000:
+            total = wanted
+        header = _build_ncsd_header(
+            [(head, size) for _content, head, _raw, size in entries], total)
+        log(f"CIA 내용 {len(entries)}개를 CCI로 묶습니다 "
+            f"(본편 {_size_text(entries[0][3])}"
+            + (f", 추가 {_size_text(packed - entries[0][3])}" if len(entries) > 1 else "")
+            + ")")
 
         dst.parent.mkdir(parents=True, exist_ok=True)
         part = dst.with_name(dst.name + ".part")
         part.unlink(missing_ok=True)
-        with part.open("wb") as target:
-            target.write(header)
-            target.write(_patch_nocrypto(plain_head))
-            copied = len(raw_head)
-            remaining = max(program.size - copied, 0)
-            if program.encrypted:
-                with AesCbc(info.title_key) as cipher:
-                    _decrypt_copy(source, target, remaining, cipher, raw_head[-16:],
-                                  progress, 0.0, 100.0, copied, ncch_size)
-            else:
-                while remaining > 0:
-                    block = source.read(min(CHUNK, remaining))
-                    if not block:
-                        break
-                    target.write(block)
-                    remaining -= len(block)
-                    copied += len(block)
+        done = 0
+        try:
+            with part.open("wb") as target:
+                target.write(header)
+
+                def report(extra: int = 0) -> None:
                     if progress:
-                        progress(100.0 * copied / ncch_size)
-            written = target.tell() - CCI_HEADER_SIZE
-            missing = ncch_size - written
-            while missing > 0:
-                step = min(CHUNK, missing)
-                target.write(b"\x00" * step)
-                missing -= step
+                        progress(min(99.0, 100.0 * (done + extra) / max(total, 1)))
+
+                for content, plain_head, raw_head, size in entries:
+                    target.write(plain_head)
+                    body = max(content.size - len(raw_head), 0)
+                    if content.encrypted:
+                        start_pct = 100.0 * (done + len(raw_head)) / max(total, 1)
+                        end_pct = 100.0 * (done + len(raw_head) + body) / max(total, 1)
+                        source.seek(content.offset + len(raw_head))
+                        with AesCbc(info.title_key) as cipher:
+                            _decrypt_copy(source, target, body, cipher, raw_head[-16:],
+                                          progress, start_pct, end_pct, 0, max(body, 1))
+                    else:
+                        source.seek(content.offset + len(raw_head))
+                        sent = 0
+                        while sent < body:
+                            block = source.read(min(CHUNK, body - sent))
+                            if not block:
+                                raise ConvertError(
+                                    "CIA를 읽는 도중에 끝났습니다. 파일이 손상됐을 수 있어요.")
+                            target.write(block)
+                            sent += len(block)
+                            report(len(raw_head) + sent)
+                    padding = size - len(plain_head) - body
+                    while padding > 0:
+                        step = min(CHUNK, padding)
+                        target.write(b"\x00" * step)
+                        padding -= step
+                    done += size
+                    report()
+
+                padding = total - CCI_HEADER_SIZE - packed
+                while padding > 0:
+                    step = min(CHUNK, padding)
+                    target.write(b"\x00" * step)
+                    padding -= step
+        except Exception:
+            part.unlink(missing_ok=True)
+            raise
         os.replace(part, dst)
     log(f"CCI 변환 완료: {dst.name} ({_size_text(dst.stat().st_size)})")
     return dst
@@ -1094,16 +1187,16 @@ def ncch_to_cci(src: Path, dst: Path, log, progress=None) -> Path:
         head = source.read(0x400)
         if len(head) < 0x400 or head[0x100:0x104] != b"NCCH":
             raise ConvertError("NCCH 헤더가 아닙니다.")
-        ncch_size = max(int.from_bytes(head[0x104:0x108], "little") * MEDIA_UNIT,
-                        _align(src.stat().st_size, MEDIA_UNIT))
+        ncch_size = _cia_ncch_size(head, src.stat().st_size)
+        plain_head = _patch_nocrypto(head)
+        header = _build_ncsd_header([(plain_head, ncch_size)])
         total = CCI_HEADER_SIZE + ncch_size
-        header = _build_ncsd_header(_patch_nocrypto(head), ncch_size, total)
         dst.parent.mkdir(parents=True, exist_ok=True)
         part = dst.with_name(dst.name + ".part")
         part.unlink(missing_ok=True)
         with part.open("wb") as target:
             target.write(header)
-            target.write(_patch_nocrypto(head))
+            target.write(plain_head)
             remaining = src.stat().st_size - len(head)
             done = len(head)
             while remaining > 0:
@@ -1174,6 +1267,72 @@ def _size_text(value: int) -> str:
             return f"{value:.0f}{unit}"
         value /= 1024
     return f"{value:.1f}TB"
+
+
+def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
+    value = 0
+    while True:
+        if pos >= len(data):
+            raise ConvertError("xdelta 패치 구조가 잘렸습니다.")
+        byte = data[pos]
+        pos += 1
+        value = (value << 7) | (byte & 0x7F)
+        if not byte & 0x80:
+            return value, pos
+
+
+def read_vcdiff_windows(path: Path) -> list[tuple[int, int, int | None]]:
+    """xdelta3(VCDIFF) 패치의 창 목록을 (대상 오프셋, 길이, adler32)로 읽는다.
+
+    패치를 적용한 결과가 공식 결과와 같은지 창 단위로 확인할 때 쓴다.
+    adler32가 없는 패치(-n으로 만들었거나 예전 형식)는 None으로 돌려준다.
+    """
+    data = path.read_bytes()
+    if len(data) < 5 or data[:4] != b"\xd6\xc3\xc4\x00":
+        raise ConvertError("xdelta3(VCDIFF) 패치 파일이 아닙니다.")
+
+    pos = 4
+    header = data[pos]
+    pos += 1
+    if header & 0x01:  # 보조 압축기 ID
+        pos += 1
+    if header & 0x02:  # 사용자 코드 테이블
+        length, pos = _read_varint(data, pos)
+        pos += length
+    if header & 0x04:  # 응용 헤더
+        length, pos = _read_varint(data, pos)
+        pos += length
+
+    windows: list[tuple[int, int, int | None]] = []
+    offset = 0
+    while pos < len(data):
+        indicator = data[pos]
+        pos += 1
+        if indicator & 0x03:  # VCD_SOURCE 또는 VCD_TARGET
+            _source_size, pos = _read_varint(data, pos)
+            _source_pos, pos = _read_varint(data, pos)
+        _delta_len, pos = _read_varint(data, pos)
+        target_len, pos = _read_varint(data, pos)
+        pos += 1  # delta indicator
+        lengths = []
+        for _ in range(3):
+            length, pos = _read_varint(data, pos)
+            lengths.append(length)
+        checksum: int | None = None
+        if indicator & 0x04:  # VCD_ADLER32
+            if pos + 4 > len(data):
+                raise ConvertError("xdelta 패치 구조가 잘렸습니다.")
+            checksum = int.from_bytes(data[pos:pos + 4], "big")
+            pos += 4
+        pos += sum(lengths)
+        if pos > len(data):
+            raise ConvertError("xdelta 패치 구조가 잘렸습니다.")
+        windows.append((offset, target_len, checksum))
+        offset += target_len
+
+    if not windows:
+        raise ConvertError("xdelta 패치에 창이 없습니다.")
+    return windows
 
 
 def describe_cia(path: Path, keys: Keys | None = None) -> tuple[int, int, int, bool]:
