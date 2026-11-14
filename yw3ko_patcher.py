@@ -32,7 +32,7 @@ from tkinter import filedialog, messagebox, ttk
 import yw3convert as converter
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -97,17 +97,20 @@ class RomInfo:
     encrypted: bool | None
     title_id: int | None
     note: str = ""
+    seed: bool = False
+    key_slots: tuple[int, ...] = ()
 
 
-def _ncch_header(data: bytes, offset: int) -> tuple[bool, int] | None:
-    """NCCH 헤더 위치에서 (암호화 여부, 프로그램 ID)를 읽는다."""
+def _ncch_header(data: bytes, offset: int) -> tuple[bool, int, bool, bytes] | None:
+    """NCCH 헤더 위치에서 (암호화 여부, 프로그램 ID, 시드 여부, 헤더)를 읽는다."""
     if offset < 0 or offset + 0x200 > len(data):
         return None
     if data[offset + 0x100: offset + 0x104] != b"NCCH":
         return None
-    no_crypto = bool(data[offset + 0x18F] & 0x04)
-    title_id = int.from_bytes(data[offset + 0x118: offset + 0x120], "big")
-    return (not no_crypto), title_id
+    header = data[offset:offset + 0x200]
+    flags7 = header[0x18F]
+    title_id = int.from_bytes(header[0x118: 0x120], "big")
+    return (not (flags7 & 0x04), title_id, bool(flags7 & 0x20), header)
 
 
 def inspect_rom(path: Path) -> RomInfo:
@@ -120,7 +123,7 @@ def inspect_rom(path: Path) -> RomInfo:
     if len(head) < 0x200:
         return RomInfo("unknown", None, None, "파일이 너무 작습니다.")
 
-    found: tuple[bool, int] | None = None
+    found: tuple[bool, int, bool, bytes] | None = None
     if head[0x100:0x104] == b"NCSD":
         kind = "cci"
         media_units = int.from_bytes(head[0x120:0x124], "little")
@@ -156,8 +159,16 @@ def inspect_rom(path: Path) -> RomInfo:
 
     if found is None:
         return RomInfo(kind, None, None, "내부 NCCH 헤더를 찾지 못했습니다.")
-    encrypted, title_id = found
-    return RomInfo(kind, encrypted, title_id)
+    encrypted, title_id, seed, header = found
+    slots: tuple[int, ...] = ()
+    if encrypted:
+        try:
+            info = converter.ncch_crypto_info(header)
+        except converter.ConvertError:
+            pass
+        else:
+            slots = info.key_slots
+    return RomInfo(kind, encrypted, title_id, seed=seed, key_slots=slots)
 
 
 def describe_rom(role_key: str, info: RomInfo) -> tuple[str, str]:
@@ -182,8 +193,9 @@ def describe_rom(role_key: str, info: RomInfo) -> tuple[str, str]:
         if info.kind == "ncch":
             return f"{label}: NCCH예요. CCI로 감싼 뒤 패치할게요.", "info"
         if info.encrypted:
-            return (f"{label}: 암호화된 CCI예요. 카드 이미지 암호는 콘솔 키가 필요해서 "
-                    "이 앱에서는 못 풀어요."), "warn"
+            seed_note = " (시드 암호라 seeddb.bin도 필요할 수 있어요)" if info.seed else ""
+            return (f"{label}: 암호화된 CCI예요. NCCH 암호를 풀어서 패치할게요."
+                    f"{seed_note}"), "info"
         return f"{label}: 정상 (복호화 CCI)", "ok"
 
     if info.kind in {"cci", "ncch"}:
@@ -444,16 +456,21 @@ def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys,
                 target = work_dir / "base_from_cia.cci"
                 return converter.cia_to_cci(path, target, keys, log, progress), True
             if info.kind == "ncch":
+                if info.encrypted:
+                    status("본편 NCCH 암호를 푸는 중...")
+                    log("[본편] NCCH를 CCI로 감싼 뒤 암호를 풉니다")
+                    wrapped = converter.ncch_to_cci(
+                        path, work_dir / "base_from_ncch.cci", log, progress)
+                    return converter.decrypt_cci(
+                        wrapped, work_dir / "base_decrypted.cci", keys, log, progress), True
                 status("본편 NCCH를 CCI로 감싸는 중...")
                 log("[본편] NCCH를 CCI로 감쌉니다")
                 return converter.ncch_to_cci(path, work_dir / "base_from_ncch.cci", log, progress), True
             if info.encrypted:
-                raise PatchError(
-                    "본편 CCI가 암호화되어 있어요.\n\n"
-                    "카드 이미지 암호는 그 3DS의 콘솔 키가 있어야 풀립니다. "
-                    "이 앱은 그 키를 다루지 않아요.\n"
-                    "복호화된 본편 CCI를 준비해 주세요."
-                )
+                status("본편 CCI 암호를 푸는 중...")
+                log(f"[본편] 암호화된 CCI의 NCCH 암호를 풉니다 ({human_size(path.stat().st_size)})")
+                return converter.decrypt_cci(
+                    path, work_dir / "base_decrypted.cci", keys, log, progress), True
         elif info.kind == "cia" and info.encrypted:
             status("업데이트 암호를 푸는 중...")
             log("[업데이트] 암호화된 CIA를 복호화합니다")
@@ -472,7 +489,9 @@ def _explain_failure(role: Role, returncode: int, raw: bytes) -> str:
             "xdelta3 메시지:\n"
             f"{text}\n\n"
             "일본판 요괴워치3 스키야키의 복호화된 원본인지 확인해 주세요.\n"
-            "본편은 복호화 CCI(v0), 업데이트는 복호화 CIA(Update 4.0)여야 합니다."
+            "본편은 복호화 CCI(v0), 업데이트는 복호화 CIA(Update 4.0)여야 합니다.\n"
+            "암호화된 파일을 이 앱에서 풀었다면 콘솔에서 직접 복호화한 파일과 "
+            "바이트가 조금 다를 수 있어요."
         )
     return f"xdelta3 실행에 실패했습니다 (종료 코드 {returncode}).\n\n{text}"
 
@@ -627,16 +646,32 @@ class PatcherApp(tk.Tk):
 
         lines: list[str] = []
         has_warning = False
-        needs_keys = False
+        infos: list[RomInfo] = []
         for role_key, path in (("base", base_path), ("update", update_path)):
             info = inspect_rom(path)
+            infos.append(info)
             message, level = describe_rom(role_key, info)
             has_warning = has_warning or level == "warn"
-            needs_keys = needs_keys or bool(info.encrypted)
             lines.append(("✓ " if level == "ok" else "") + message)
-        if needs_keys and not converter.find_keys([base_path.parent, update_path.parent]).common:
-            lines.append("· 암호를 풀려면 keys.txt가 필요해요 (롬과 같은 폴더에 두면 자동으로 읽어요).")
+
+        keys = converter.load_keys([base_path.parent, update_path.parent])
+        hints: list[str] = []
+        if any(info.kind == "cia" and info.encrypted for info in infos) and not keys.common:
+            hints.append("· 암호화된 CIA를 풀려면 keys.txt의 common 키가 필요해요.")
+        missing = sorted({slot for info in infos if info.encrypted
+                          for slot in info.key_slots if slot not in keys.keyx})
+        if missing:
+            names = ", ".join(f"slot0x{slot:02X}KeyX" for slot in missing)
+            hints.append(f"· 암호화된 CCI를 풀려면 keys.txt에 {names}가 필요해요.")
+        for info in infos:
+            if (info.encrypted and info.seed and info.title_id is not None
+                    and info.title_id not in keys.seeds):
+                hints.append(f"· 시드 암호가 걸린 CCI예요. seeddb.bin이나 "
+                             f"seed_{info.title_id:016X} 줄이 필요해요.")
+        if hints:
             has_warning = True
+            lines.extend(hints)
+            lines.append("· keys.txt와 seeddb.bin은 롬과 같은 폴더에 두면 자동으로 읽어요.")
         if has_warning:
             self._set_ready("\n".join(lines), "Warn.TLabel", True)
         else:
@@ -701,13 +736,15 @@ class PatcherApp(tk.Tk):
         needed = sum(role.result_size for role in ROLES) + 256 * 1024 * 1024
         for path in (base, update):
             info = inspect_rom(path)
-            if info.kind == "cia" or (info.kind == "ncch" and path == base):
+            if info.kind == "cia" or (path == base and info.kind == "ncch"):
                 needed += path.stat().st_size  # 변환/복호화 임시 파일
+            elif path == base and info.kind == "cci" and info.encrypted:
+                needed += path.stat().st_size  # 복호화한 CCI 임시 파일
         free = shutil.disk_usage(out_dir).free
         if free < needed:
             self._log(f"저장 공간이 부족할 수 있습니다. 필요 약 {human_size(needed)}, 남은 공간 {human_size(free)}")
 
-        keys = converter.find_keys([base.parent, update.parent])
+        keys = converter.load_keys([base.parent, update.parent])
         self._last_out_dir = out_dir
         self._set_busy(True)
         self.progress["value"] = 0
@@ -717,7 +754,10 @@ class PatcherApp(tk.Tk):
         self._log(f"본편: {base}")
         self._log(f"업데이트: {update}")
         self._log(f"저장 위치: {out_dir}")
-        self._log(f"키 파일: {keys.path}" if keys.common else "키 파일: 없음 (암호화된 파일이면 필요해요)")
+        has_keys = bool(keys.common or keys.keyx or keys.seeds)
+        self._log(f"키 파일: {keys.path}" if has_keys else "키 파일: 없음 (암호화된 파일이면 필요해요)")
+        if keys.seeds:
+            self._log(f"시드: {len(keys.seeds)}개 준비됨")
         for role_key, path in (("base", base), ("update", update)):
             self._log(describe_rom(role_key, inspect_rom(path))[0])
         threading.Thread(target=self._worker, args=(base, update, out_dir, keys), daemon=True).start()
