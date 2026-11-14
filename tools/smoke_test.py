@@ -252,7 +252,7 @@ def test_rom_detection(work: Path) -> None:
         ("update", update_ok, "ok"),
         ("update", encrypted, "info"),
         ("base", base_cia, "info"),
-        ("base", enc_cci, "warn"),
+        ("base", enc_cci, "info"),
         ("base", other_title, "warn"),
         ("base", junk, "info"),
         ("update", junk, "info"),
@@ -434,6 +434,251 @@ def test_converter(work: Path) -> None:
     print("[ok] AES-CBC 자체 점검")
 
 
+def make_crypto_ncch(title_id: int, seed: bytes | None, version: int = 0,
+                     flags3: int = 0x0A, size: int = 0x3000) -> bytes:
+    """복호화된 상태의 가짜 NCCH(확장 헤더/ExeFS/RomFS 포함)를 만든다."""
+    data = bytearray(size)
+    for index in range(size):
+        data[index] = (index * 7 + 0x11) & 0xFF
+
+    header = bytearray(0x200)
+    header[0:16] = bytes(range(16))
+    header[0x100:0x104] = b"NCCH"
+    header[0x104:0x108] = (size // 0x200).to_bytes(4, "little")
+    header[0x108:0x110] = title_id.to_bytes(8, "big")
+    header[0x112:0x114] = version.to_bytes(2, "little")
+    if seed is not None:
+        header[0x114:0x118] = converter._seed_hash(seed, title_id)
+    header[0x118:0x120] = title_id.to_bytes(8, "big")
+
+    exthdr = bytearray(0x800)
+    for index in range(len(exthdr)):
+        exthdr[index] = (index * 3) & 0xFF
+    header[0x160:0x180] = hashlib.sha256(exthdr[:0x400]).digest()
+    header[0x180:0x184] = (0x400).to_bytes(4, "little")
+
+    header[0x190:0x194] = (5).to_bytes(4, "little")   # 평문 영역 0xA00
+    header[0x194:0x198] = (3).to_bytes(4, "little")
+
+    header[0x1A0:0x1A4] = (8).to_bytes(4, "little")   # ExeFS 0x1000
+    header[0x1A4:0x1A8] = (4).to_bytes(4, "little")
+    header[0x1A8:0x1AC] = (1).to_bytes(4, "little")
+    exefs_header = bytearray(0x200)
+    files = ((b"code", 0x000, 0x180), (b"icon", 0x200, 0x100), (b"banner", 0x400, 0x200))
+    for index, (name, offset, length) in enumerate(files):
+        entry = index * 0x10
+        exefs_header[entry:entry + 8] = name.ljust(8, b"\x00")
+        struct.pack_into("<I", exefs_header, entry + 8, offset)
+        struct.pack_into("<I", exefs_header, entry + 12, length)
+    header[0x1C0:0x1E0] = hashlib.sha256(exefs_header).digest()
+
+    header[0x1B0:0x1B4] = (16).to_bytes(4, "little")  # RomFS 0x2000
+    header[0x1B4:0x1B8] = (8).to_bytes(4, "little")
+    header[0x1B8:0x1BC] = (1).to_bytes(4, "little")
+    romfs_head = bytearray(0x200)
+    romfs_head[0:4] = b"IVFC"
+    for index in range(4, 0x200):
+        romfs_head[index] = (index * 5) & 0xFF
+    header[0x1E0:0x200] = hashlib.sha256(romfs_head).digest()
+
+    data[0:0x200] = header
+    data[0x200:0xA00] = exthdr
+    data[0x1000:0x1200] = exefs_header
+    data[0x2000:0x2200] = romfs_head
+    return bytes(data)
+
+
+def build_crypto_cci(work: Path, name: str, plain: bytes, version: int,
+                     flags3: int, seed: bytes | None) -> tuple[Path, bytes, converter.Keys]:
+    """평문 NCCH를 표준 암호로 다시 암호화한 CCI를 만든다."""
+    title_id = int.from_bytes(plain[0x118:0x120], "big")
+    keyx = {
+        0x2C: bytes.fromhex("00112233445566778899aabbccddeeff"),
+        0x18: bytes.fromhex("ffeeddccbbaa99887766554433221100"),
+        0x25: bytes.fromhex("0123456789abcdef0123456789abcdef"),
+    }
+    keys = converter.Keys(keyx=keyx, seeds={title_id: seed} if seed else {})
+    key_menu = converter.normal_key(keyx[0x2C], plain[0:16])
+    key_y = (plain[0:16] if seed is None
+             else hashlib.sha256(plain[0:16] + seed).digest()[:16])
+    key_content = converter.normal_key(keyx[0x18], key_y)
+
+    def ctr_of(section: int, start: int) -> int:
+        partition_id = plain[0x108:0x110]
+        if version == 1:
+            return (int.from_bytes(partition_id, "big") << 64) | start
+        return (int.from_bytes(partition_id, "little") << 64) | (section << 56)
+
+    total = 0x4000 + len(plain)
+    cci_head = converter._build_ncsd_header(plain[:0x200], len(plain), total)
+    data = bytearray(cci_head) + bytearray(plain)
+    part = 0x4000
+    data[part + 0x18B] = flags3
+    data[part + 0x18F] = 0x20 if seed is not None else 0
+
+    def crypt(start: int, size: int, key: bytes, base: int, offset: int) -> None:
+        data[part + start:part + start + size] = converter.ctr_decrypt(
+            key, base, offset, bytes(data[part + start:part + start + size]))
+
+    crypt(0x200, 0x800, key_menu, ctr_of(1, 0x200), 0)
+    crypt(0x1000, 0x200, key_menu, ctr_of(2, 0x1000), 0)
+    crypt(0x1200, 0x180, key_content, ctr_of(2, 0x1000), 0x200)
+    crypt(0x1380, 0x80, key_menu, ctr_of(2, 0x1000), 0x380)
+    crypt(0x1400, 0x100, key_menu, ctr_of(2, 0x1000), 0x400)
+    crypt(0x1500, 0x100, key_menu, ctr_of(2, 0x1000), 0x500)
+    crypt(0x1600, 0x200, key_menu, ctr_of(2, 0x1000), 0x600)
+    crypt(0x2000, 0x1000, key_content, ctr_of(3, 0x2000), 0)
+
+    expected = bytearray(cci_head) + bytearray(plain)
+    expected[part + 0x18B] = 0
+    expected[part + 0x18F] = 0x04
+    path = work / name
+    path.write_bytes(bytes(data))
+    return path, bytes(expected), keys
+
+
+def test_cci_decrypt(work: Path) -> None:
+    """암호화 CCI를 풀어 평문과 같은지 확인한다(표준/시드/version 1)."""
+    title_id = app.YW3_BASE_TITLE
+    seed = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+    wrong_seed = bytes.fromhex("ffeeddccbbaa99887766554433221100")
+    cases = (
+        (0, None, "표준 암호"),
+        (0, seed, "시드 암호"),
+        (1, seed, "version 1 + 시드"),
+    )
+    enc_paths = {}
+    for version, seed_value, label in cases:
+        plain = make_crypto_ncch(title_id, seed_value, version=version)
+        name = f"crypto_{version}_{'seed' if seed_value else 'std'}"
+        enc_path, expected, keys = build_crypto_cci(
+            work, name + ".cci", plain, version, 0x0A, seed_value)
+        enc_paths[name] = (enc_path, expected, keys)
+        out = converter.decrypt_cci(
+            enc_path, work / (name + "_dec.cci"), keys,
+            lambda message: None, lambda percent: None)
+        assert out.read_bytes() == expected, f"{label}: 복호화 결과가 평문과 다름"
+        info = app.inspect_rom(enc_path)
+        assert info.kind == "cci" and info.encrypted is True, f"{label}: 판별 실패"
+        assert info.key_slots == (0x2C, 0x18), f"{label}: 키 슬롯 {info.key_slots}"
+        print(f"[ok] CCI 복호화 — {label}")
+
+    enc_path, _expected, keys = enc_paths["crypto_0_std"]
+    try:
+        converter.decrypt_cci(enc_path, work / "no_key.cci", converter.Keys(),
+                              lambda message: None, lambda percent: None)
+    except converter.ConvertError as exc:
+        assert "slot0x2CKeyX" in str(exc), str(exc)
+        print("[ok] keyX 없을 때 안내")
+    else:
+        raise AssertionError("keyX가 없는데 복호화가 됐다")
+
+    seed_path, _expected, seed_keys = enc_paths["crypto_0_seed"]
+    try:
+        converter.decrypt_cci(seed_path, work / "no_seed.cci",
+                              converter.Keys(keyx=seed_keys.keyx),
+                              lambda message: None, lambda percent: None)
+    except converter.ConvertError as exc:
+        assert "seeddb.bin" in str(exc), str(exc)
+        print("[ok] 시드 없을 때 안내")
+    else:
+        raise AssertionError("시드가 없는데 복호화가 됐다")
+
+    try:
+        converter.decrypt_cci(seed_path, work / "bad_seed.cci",
+                              converter.Keys(keyx=seed_keys.keyx, seeds={title_id: wrong_seed}),
+                              lambda message: None, lambda percent: None)
+    except converter.ConvertError as exc:
+        assert "맞지 않" in str(exc), str(exc)
+        print("[ok] 시드가 틀릴 때 안내")
+    else:
+        raise AssertionError("시드가 틀렸는데 복호화가 됐다")
+
+    bad_keys = {slot: bytes(16) for slot in keys.keyx}
+    try:
+        converter.decrypt_cci(enc_path, work / "bad_key.cci",
+                              converter.Keys(keyx=bad_keys),
+                              lambda message: None, lambda percent: None)
+    except converter.ConvertError as exc:
+        assert "확장 헤더" in str(exc), str(exc)
+        print("[ok] keyX가 틀릴 때 안내")
+    else:
+        raise AssertionError("keyX가 틀렸는데 복호화가 됐다")
+
+    decrypted = work / "crypto_0_std_dec.cci"
+    try:
+        converter.decrypt_cci(decrypted, work / "again.cci", keys,
+                              lambda message: None, lambda percent: None)
+    except converter.ConvertError as exc:
+        assert "이미 복호화" in str(exc), str(exc)
+        print("[ok] 이미 복호화된 CCI 안내")
+    else:
+        raise AssertionError("이미 복호화된 CCI를 또 풀었다")
+
+
+def test_ctr_stream(work: Path) -> None:
+    """CTR 키스트림이 1MiB 배치 경계와 비정렬 오프셋에서도 맞는지 확인한다."""
+    key = bytes.fromhex("00112233445566778899aabbccddeeff")
+    size = converter.CTR_BATCH_BLOCKS * 16 * 2 + 0x1234  # 배치 두 개 + 자투리
+    data = bytes((index * 31 + 7) & 0xFF for index in range(size))
+    base = (0x00040000001AF400 << 64) | (2 << 56)
+
+    blocks = (size + 15) // 16
+    with converter.AesEcb(key) as aes:
+        stream = aes.encrypt_blocks(converter._counters_general(base, blocks))
+    expected = converter._xor_bytes(data, stream[:size])
+
+    assert converter.ctr_decrypt(key, base, 0, data) == expected, "배치 경계에서 어긋남"
+    with converter.CtrCipher(key, base) as cipher:
+        assert cipher.decrypt(0, data) == expected
+        for offset in (5, 16, 0x1000):
+            begin = offset
+            end = min(size, begin + 0x2345)
+            piece = data[begin:end]
+            assert cipher.decrypt(begin, piece) == expected[begin:end], f"오프셋 {offset} 어긋남"
+
+    # NIST SP 800-38A AES-128-CTR 첫 블록(카운터는 128비트 빅엔디언)
+    kat_key = bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c")
+    kat_ctr = int.from_bytes(bytes.fromhex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"), "big")
+    kat_plain = bytes.fromhex("6bc1bee22e409f96e93d7e117393172a")
+    kat_cipher = bytes.fromhex("874d6191b620e3261bef6864990db6ce")
+    assert converter.ctr_decrypt(kat_key, kat_ctr, 0, kat_cipher) == kat_plain, "NIST CTR 벡터 불일치"
+    print("[ok] CTR 키스트림 (1MiB 배치 경계/비정렬 오프셋/NIST 벡터)")
+
+
+def test_key_files(work: Path) -> None:
+    """keys.txt의 keyX/seed 줄과 seeddb.bin 병합을 확인한다."""
+    title_id = app.YW3_BASE_TITLE
+    keyx_2c = bytes.fromhex("00112233445566778899aabbccddeeff")
+    keyx_18 = bytes.fromhex("ffeeddccbbaa99887766554433221100")
+    seed = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+
+    key_dir = work / "key_dir"
+    key_dir.mkdir()
+    (key_dir / "keys.txt").write_text(
+        f"slot0x2CKeyX: {keyx_2c.hex()}\n"
+        f"keyX18 = {keyx_18.hex().upper()}\n"
+        f"common: {'11' * 16}\n",
+        encoding="utf-8",
+    )
+    parsed = converter.load_keys_file(key_dir / "keys.txt")
+    assert parsed.keyx[0x2C] == keyx_2c and parsed.keyx[0x18] == keyx_18, parsed.keyx
+    assert parsed.common == bytes.fromhex("11" * 16)
+
+    seed_dir = work / "seed_dir"
+    seed_dir.mkdir()
+    seeddb = bytearray(16 + 0x20)
+    struct.pack_into("<I", seeddb, 0, 1)
+    seeddb[16:24] = title_id.to_bytes(8, "little")
+    seeddb[24:40] = seed
+    (seed_dir / "seeddb.bin").write_bytes(bytes(seeddb))
+    assert converter.load_seeddb(seed_dir / "seeddb.bin")[title_id] == seed
+
+    merged = converter.load_keys([key_dir, seed_dir])
+    assert merged.keyx[0x2C] == keyx_2c and merged.seeds[title_id] == seed, merged
+    print("[ok] keys.txt keyX/seed 줄, seeddb.bin 병합")
+
+
 def test_convert_levels(work: Path) -> None:
     """변환 대상 파일이 경고가 아니라 '변환해서 진행' 안내로 보이는지 확인한다."""
     title_key = bytes.fromhex("00112233445566778899aabbccddeeff")
@@ -455,7 +700,7 @@ def test_prepare_pipeline(exe: Path, work: Path) -> None:
     title_key = bytes.fromhex("00112233445566778899aabbccddeeff")
     common_key = bytes.fromhex("ffeeddccbbaa99887766554433221100")
     title_id = app.YW3_BASE_TITLE
-    keys = converter.Keys(common_key, work / "keys.txt")
+    keys = converter.Keys(common=common_key, path=work / "keys.txt")
 
     ncch_file = work / "pipe.app"
     ncch_file.write_bytes(make_fake_ncch(title_id, 0x8000))
@@ -471,6 +716,18 @@ def test_prepare_pipeline(exe: Path, work: Path) -> None:
         assert prepared.read_bytes() == reference.read_bytes(), "변환 결과가 기준 CCI와 다름"
         prepared.unlink()
     print("[ok] prepare_source: CIA → CCI (평문/암호문 모두)")
+
+    seed = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+    plain_ncch = make_crypto_ncch(title_id, seed)
+    enc_cci, expected_cci, cci_keys = build_crypto_cci(
+        work, "pipe_enc.cci", plain_ncch, 0, 0x0A, seed)
+    prepared, converted = app.prepare_source(
+        app.BASE, enc_cci, work, cci_keys,
+        lambda m: None, lambda s: None, lambda p: None)
+    assert converted, "암호화 CCI인데 변환으로 표시되지 않음"
+    assert prepared.read_bytes() == expected_cci, "암호화 CCI 복호화 결과가 다름"
+    prepared.unlink()
+    print("[ok] prepare_source: 암호화 CCI → 복호화 CCI")
 
     target = work / "pipe_target.bin"
     data = bytearray(reference.read_bytes())
@@ -507,6 +764,9 @@ def main() -> int:
         test_apply_roundtrip(exe, work)
         test_rom_detection(work)
         test_converter(work)
+        test_key_files(work)
+        test_ctr_stream(work)
+        test_cci_decrypt(work)
         test_convert_levels(work)
         test_prepare_pipeline(exe, work)
         test_ui_states(work)

@@ -1,23 +1,27 @@
 """3DS 컨테이너 변환/복호화.
 
-이 모듈은 세 가지 일을 한다.
+이 모듈은 네 가지 일을 한다.
 
 - 암호화된 CIA의 내용을 복호화한다 (티켓의 타이틀 키 사용).
+- 암호화된 CCI(NCSD)의 NCCH 구간을 복호화한다 (NCCH 표준 암호).
 - CIA(또는 NCCH)를 CCI로 다시 묶는다.
 - 파일 헤더를 읽어 컨테이너 구조를 파악한다.
 
-AES-CBC는 Windows CNG(bcrypt.dll)를 그대로 쓴다. 외부 패키지가 없어도 되고
+AES는 Windows CNG(bcrypt.dll)를 그대로 쓴다. 외부 패키지가 없어도 되고
 exe에 같이 들어간다. 키는 앱에 넣지 않고 사용자가 둔 keys.txt에서만 읽는다.
 
-참고한 문서: 3dbrew.org (CIA, Ticket, TMD, NCCH, NCSD)
+참고한 문서: 3dbrew.org (CIA, Ticket, TMD, NCCH, NCSD), GodMode9/Decrypt9 소스
 """
 
 from __future__ import annotations
 
+import array
 import ctypes
+import hashlib
 import os
 import re
 import struct
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from ctypes import wintypes
@@ -77,9 +81,9 @@ def _ntstatus(status: int) -> None:
 
 
 class AesCbc:
-    """AES-CBC 한 벌. with 문으로 열고 닫는다."""
+    """AES 한 벌(CBC/ECB). with 문으로 열고 닫는다."""
 
-    def __init__(self, key: bytes) -> None:
+    def __init__(self, key: bytes, chaining: str = "CBC") -> None:
         if len(key) != 16:
             raise ConvertError("AES 키 길이가 16바이트가 아닙니다.")
         self._alg = wintypes.HANDLE()
@@ -87,7 +91,7 @@ class AesCbc:
         _ntstatus(_bcrypt.BCryptOpenAlgorithmProvider(
             ctypes.byref(self._alg), "AES", None, 0))
         try:
-            mode = "ChainingModeCBC".encode("utf-16-le") + b"\x00\x00"
+            mode = f"ChainingMode{chaining}".encode("utf-16-le") + b"\x00\x00"
             _ntstatus(_bcrypt.BCryptSetProperty(
                 self._alg, "ChainingMode", mode, len(mode), 0))
             key_buf = ctypes.create_string_buffer(key, len(key))
@@ -111,16 +115,16 @@ class AesCbc:
     def __exit__(self, *_exc) -> None:
         self.close()
 
-    def _run(self, data: bytes, iv: bytes, encrypt: bool) -> bytes:
+    def _run(self, data: bytes, iv: bytes | None, encrypt: bool) -> bytes:
         if len(data) % 16:
             raise ConvertError("암호화 데이터 길이가 16의 배수가 아닙니다.")
         if not data:
             return b""
         out = ctypes.create_string_buffer(len(data))
         written = wintypes.ULONG(0)
-        iv_buf = ctypes.create_string_buffer(iv, 16)
+        iv_buf = ctypes.create_string_buffer(iv, 16) if iv is not None else None
         func = _bcrypt.BCryptEncrypt if encrypt else _bcrypt.BCryptDecrypt
-        _ntstatus(func(self._key, data, len(data), None, iv_buf, 16,
+        _ntstatus(func(self._key, data, len(data), None, iv_buf, 16 if iv_buf else 0,
                        out, len(data), ctypes.byref(written), 0))
         return out.raw[:written.value]
 
@@ -129,6 +133,16 @@ class AesCbc:
 
     def encrypt(self, data: bytes, iv: bytes) -> bytes:
         return self._run(data, iv, encrypt=True)
+
+
+class AesEcb(AesCbc):
+    """AES-ECB 한 벌. CTR 카운터 블록을 암호화할 때 쓴다."""
+
+    def __init__(self, key: bytes) -> None:
+        super().__init__(key, chaining="ECB")
+
+    def encrypt_blocks(self, data: bytes) -> bytes:
+        return self._run(data, None, encrypt=True)
 
 
 def cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
@@ -141,22 +155,191 @@ def cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
         return cipher.encrypt(data, iv)
 
 
+# --------------------------------------------------------------------- CTR
+#
+# 3DS NCCH는 AES-CTR을 쓴다. 카운터는 빅엔디언 128비트이고 16바이트마다 1씩 는다.
+# Windows CNG에는 CTR 모드가 없어서(이 PC에서 확인) 카운터 블록을 ECB로 한꺼번에
+# 암호화한 뒤 데이터와 XOR한다. 카운터 블록은 1MiB 단위로 모아서 만든다.
+
+CTR_BATCH_BLOCKS = 1 << 16  # 1MiB
+_MASK64 = (1 << 64) - 1
+# j = 0..65535일 때 BE32(j)의 3번째/4번째 바이트 모양
+_CTR_BYTE14 = b"".join(bytes([value]) * 256 for value in range(256))
+_CTR_BYTE15 = bytes(range(256)) * 256
+
+
+def _xor_bytes(data: bytes, stream: bytes) -> bytes:
+    size = len(data)
+    if not size:
+        return b""
+    return (int.from_bytes(data, "little") ^ int.from_bytes(stream, "little")).to_bytes(
+        size, "little")
+
+
+def _counters_general(ctr: int, blocks: int) -> bytes:
+    """ctr부터 blocks개의 빅엔디언 128비트 카운터를 만든다."""
+    low = ctr & _MASK64
+    high = (ctr >> 64) & _MASK64
+    if low + blocks > _MASK64:
+        first = _MASK64 + 1 - low
+        return _counters_general(ctr, first) + _counters_general(ctr + first, blocks - first)
+    values = array.array("Q", range(low, low + blocks))
+    if sys.byteorder == "little":
+        values.byteswap()
+    lows = values.tobytes()
+    out = bytearray(16 * blocks)
+    high_bytes = high.to_bytes(8, "big")
+    for index in range(8):
+        out[index::16] = bytes([high_bytes[index]]) * blocks
+        out[8 + index::16] = lows[index::8]
+    return bytes(out)
+
+
+class _CtrSection:
+    """구간 시작(카운터 하위 56비트가 0) 카운터를 빠르게 만드는 틀."""
+
+    def __init__(self, base: int) -> None:
+        self.base = base
+        self.template = bytearray(16 * CTR_BATCH_BLOCKS)
+        high_bytes = ((base >> 64) & _MASK64).to_bytes(8, "big")
+        for index in range(8):
+            self.template[index::16] = bytes([high_bytes[index]]) * CTR_BATCH_BLOCKS
+        self.template[8::16] = bytes([(base >> 56) & 0xFF]) * CTR_BATCH_BLOCKS
+        self.template[14::16] = _CTR_BYTE14
+        self.template[15::16] = _CTR_BYTE15
+
+    def counters(self, block: int, count: int) -> bytes:
+        chunk, rest = divmod(block, CTR_BATCH_BLOCKS)
+        if rest == 0 and 0 <= chunk < 0x10000 and count <= CTR_BATCH_BLOCKS:
+            if count == CTR_BATCH_BLOCKS:
+                out = bytearray(self.template)
+            else:
+                out = bytearray(self.template[:16 * count])
+            out[12::16] = bytes([(chunk >> 8) & 0xFF]) * count
+            out[13::16] = bytes([chunk & 0xFF]) * count
+            return bytes(out)
+        return _counters_general(self.base + block, count)
+
+
+class CtrCipher:
+    """NCCH 한 구간용 AES-CTR. offset은 구간 시작부터의 바이트 위치."""
+
+    def __init__(self, key: bytes, ctr_base: int) -> None:
+        self._aes = AesEcb(key)
+        self._base = ctr_base
+        self._section: _CtrSection | None = None
+        self._fast = (ctr_base & ((1 << 56) - 1)) == 0
+
+    def close(self) -> None:
+        self._aes.close()
+
+    def __enter__(self) -> "CtrCipher":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def _keystream(self, block: int, blocks: int) -> bytes:
+        if self._fast:
+            if self._section is None:
+                self._section = _CtrSection(self._base)
+            counters = self._section.counters(block, blocks)
+        else:
+            counters = _counters_general(self._base + block, blocks)
+        return self._aes.encrypt_blocks(counters)
+
+    def decrypt(self, offset: int, data: bytes) -> bytes:
+        total = len(data)
+        out = bytearray(total)
+        pos = 0
+        while pos < total:
+            absolute = offset + pos
+            skip = absolute % 16
+            block = absolute // 16
+            take = min(total - pos, CTR_BATCH_BLOCKS * 16 - skip)
+            blocks = (skip + take + 15) // 16
+            piece = self._keystream(block, blocks)[skip:skip + take]
+            out[pos:pos + take] = _xor_bytes(data[pos:pos + take], piece)
+            pos += take
+        return bytes(out)
+
+
+def ctr_decrypt(key: bytes, ctr_base: int, offset: int, data: bytes) -> bytes:
+    with CtrCipher(key, ctr_base) as cipher:
+        return cipher.decrypt(offset, data)
+
+
+# ------------------------------------------------------------- NCCH keys
+
+
+def _rol128(value: int, bits: int) -> int:
+    bits %= 128
+    mask = (1 << 128) - 1
+    return ((value << bits) | (value >> (128 - bits))) & mask
+
+
+def normal_key(key_x: bytes, key_y: bytes) -> bytes:
+    """keyX/keyY로 NCCH 표준 암호에 쓰는 normal key를 만든다(키 스크램블러)."""
+    scrambled = _rol128(
+        (_rol128(int.from_bytes(key_x, "big"), 2) ^ int.from_bytes(key_y, "big"))
+        + 0x1FF9E9AAC5FE0408024591DC5D52768A,
+        87,
+    )
+    return scrambled.to_bytes(16, "big")
+
+
 # -------------------------------------------------------------------- keys
 
 
 @dataclass(frozen=True)
 class Keys:
     common: bytes | None = None
+    keyx: dict[int, bytes] = field(default_factory=dict)
+    seeds: dict[int, bytes] = field(default_factory=dict)
     path: Path | None = None
 
 
+def _parse_keyx_slot(name: str) -> int | None:
+    """'slot0x2CKeyX', 'keyX2C', '2c' 같은 이름에서 keyX 슬롯 번호를 뽑는다."""
+    lowered = name.lower()
+    if "keyx" not in lowered and not lowered.startswith("slot"):
+        return None
+    cleaned = lowered.replace("keyx", "").replace("slot", "").replace("0x", "")
+    cleaned = cleaned.replace("_", "").replace("-", "").replace(" ", "")
+    if not cleaned or len(cleaned) > 2:
+        return None
+    if any(char not in "0123456789abcdef" for char in cleaned):
+        return None
+    return int(cleaned, 16)
+
+
+def _parse_seed_title(name: str) -> int | None:
+    """'seed_00040000001AF400' 같은 이름에서 타이틀 ID를 뽑는다."""
+    lowered = name.lower()
+    if "seed" not in lowered:
+        return None
+    match = re.search(r"[0-9a-f]{16}", lowered)
+    if not match:
+        return None
+    return int(match.group(0), 16)
+
+
 def load_keys_file(path: Path) -> Keys:
-    """keys.txt에서 common 키를 찾는다. 'common: <32 hex>' 형식을 권장한다."""
+    """keys.txt에서 common/keyX/seed를 읽는다.
+
+    권장 형식:
+        common: <32 hex>
+        slot0x2CKeyX: <32 hex>
+        seed_00040000001AF400: <32 hex>
+    """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return Keys()
+    common: bytes | None = None
     bare: bytes | None = None
+    keyx: dict[int, bytes] = {}
+    seeds: dict[int, bytes] = {}
     for line in text.splitlines():
         line = line.split("#", 1)[0].strip()
         if not line:
@@ -168,17 +351,25 @@ def load_keys_file(path: Path) -> Keys:
         value = value.replace(" ", "").replace("-", "")
         if len(value) != 32 or any(c not in "0123456789abcdefABCDEF" for c in value):
             continue
+        data = bytes.fromhex(value)
         if "common" in name:
-            return Keys(bytes.fromhex(value), path)
+            common = common or data
+            continue
+        slot = _parse_keyx_slot(name)
+        if slot is not None:
+            keyx.setdefault(slot, data)
+            continue
+        title_id = _parse_seed_title(name)
+        if title_id is not None:
+            seeds.setdefault(title_id, data)
+            continue
         if not name and bare is None:
-            bare = bytes.fromhex(value)
-    if bare is not None:
-        return Keys(bare, path)
-    return Keys(None, path)
+            bare = data
+    return Keys(common or bare, keyx, seeds, path)
 
 
 def find_keys(search_dirs: list[Path]) -> Keys:
-    """키 파일을 찾아 common 키를 읽는다. 없으면 빈 Keys."""
+    """키 파일을 찾아 common/keyX/seed를 읽는다. 없으면 빈 Keys."""
     candidates: list[Path] = []
     override = os.environ.get(KEYS_ENV)
     if override:
@@ -186,12 +377,431 @@ def find_keys(search_dirs: list[Path]) -> Keys:
     for folder in search_dirs:
         for name in KEYS_NAMES:
             candidates.append(folder / name)
+    common: bytes | None = None
+    keyx: dict[int, bytes] = {}
+    seeds: dict[int, bytes] = {}
+    found_path: Path | None = None
     for path in candidates:
-        if path.is_file():
-            keys = load_keys_file(path)
-            if keys.common:
-                return keys
-    return Keys()
+        if not path.is_file():
+            continue
+        keys = load_keys_file(path)
+        if keys.common or keys.keyx or keys.seeds:
+            found_path = found_path or path
+        common = common or keys.common
+        for slot, key in keys.keyx.items():
+            keyx.setdefault(slot, key)
+        for title_id, seed in keys.seeds.items():
+            seeds.setdefault(title_id, seed)
+    return Keys(common, keyx, seeds, found_path)
+
+
+# ----------------------------------------------------------- seeddb.bin
+
+
+SEEDDB_NAMES = ("seeddb.bin",)
+
+
+def load_seeddb(path: Path) -> dict[int, bytes]:
+    """seeddb.bin(GodMode9 덤프)에서 타이틀별 시드를 읽는다."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {}
+    if len(data) < 16:
+        return {}
+    count = int.from_bytes(data[0:4], "little")
+    available = max((len(data) - 16) // 0x20, 0)
+    if count > available:
+        count = available
+    seeds: dict[int, bytes] = {}
+    for index in range(count):
+        entry = 16 + index * 0x20
+        title_id = int.from_bytes(data[entry:entry + 8], "little")
+        seed = data[entry + 8:entry + 24]
+        if title_id and len(seed) == 16:
+            seeds[title_id] = seed
+    return seeds
+
+
+def find_seeds(search_dirs: list[Path]) -> dict[int, bytes]:
+    """seeddb.bin을 찾아 시드 목록을 읽는다. 없으면 빈 dict."""
+    for folder in search_dirs:
+        for name in SEEDDB_NAMES:
+            path = folder / name
+            if path.is_file():
+                seeds = load_seeddb(path)
+                if seeds:
+                    return seeds
+    return {}
+
+
+def load_keys(search_dirs: list[Path]) -> Keys:
+    """keys.txt와 seeddb.bin을 함께 읽는다. keys.txt의 시드가 우선한다."""
+    keys = find_keys(search_dirs)
+    seeds = find_seeds(search_dirs)
+    if not seeds:
+        return keys
+    merged = dict(seeds)
+    merged.update(keys.seeds)
+    return Keys(keys.common, keys.keyx, merged, keys.path)
+
+
+# --------------------------------------------------- CCI (NCSD) decryption
+#
+# CCI/3DS 안에는 NCCH가 파티션으로 들어 있다. NCCH 헤더 자체는 평문이고,
+# 확장 헤더/ExeFS/RomFS만 AES-CTR로 암호화되어 있다. 복호화에 필요한 keyX는
+# 앱에 넣지 않고 keys.txt에서만 읽는다. 시드 암호면 seeddb.bin도 쓴다.
+#
+# 카드리더 하드웨어 단계(SNOW 2.0 + RC4)는 여기서 다루지 않는다. 그건 콘솔에서
+# 카드를 읽을 때 풀리는 암호라서, 이미 .3ds로 덤프된 파일에는 해당되지 않는다.
+
+NCCH_MAGIC = b"NCCH"
+NCSD_PARTITIONS = 8
+
+
+@dataclass(frozen=True)
+class NcchCryptoInfo:
+    """NCCH 헤더에서 뽑은 암호 관련 정보."""
+
+    program_id: int
+    version: int
+    flags3: int
+    flags7: int
+    seed_crypto: bool
+    fixed_key: bool
+    key_slots: tuple[int, int]  # (메뉴 정보용 keyid 0, 본문용 keyid 1)
+
+
+def ncch_crypto_info(header: bytes) -> NcchCryptoInfo:
+    if len(header) < 0x200 or header[0x100:0x104] != NCCH_MAGIC:
+        raise ConvertError("NCCH 헤더가 아닙니다.")
+    flags3 = header[0x18B]
+    flags7 = header[0x18F]
+    if not flags3:
+        content_slot = 0x2C
+    elif flags3 == 0x0A:
+        content_slot = 0x18
+    elif flags3 == 0x0B:
+        content_slot = 0x1B
+    else:
+        content_slot = 0x25
+    return NcchCryptoInfo(
+        program_id=int.from_bytes(header[0x118:0x120], "big"),
+        version=int.from_bytes(header[0x112:0x114], "little"),
+        flags3=flags3,
+        flags7=flags7,
+        seed_crypto=bool(flags7 & 0x20),
+        fixed_key=bool(flags7 & 0x01),
+        key_slots=(0x2C, content_slot),
+    )
+
+
+@dataclass
+class NcchPartition:
+    """NCSD 파티션 하나. offset/size는 파일 안에서의 바이트 위치."""
+
+    index: int
+    offset: int
+    size: int
+    header: bytes
+
+
+@dataclass
+class _DecryptRange:
+    """복호화할 구간. offset은 기준(NCCH 또는 파일) 시작부터의 바이트."""
+
+    offset: int
+    size: int
+    key: bytes
+    ctr_base: int
+    ctr_offset: int
+
+
+@dataclass
+class _PartitionPlan:
+    partition: NcchPartition
+    ranges: list[_DecryptRange]  # NCCH 안에서의 위치
+    header_patch: bytes
+    seed_crypto: bool
+
+
+def read_ncsd(path: Path) -> list[NcchPartition]:
+    """NCSD(CCI) 헤더와 파티션별 NCCH 헤더를 읽는다."""
+    total = path.stat().st_size
+    with path.open("rb") as handle:
+        head = handle.read(CCI_HEADER_SIZE)
+        if len(head) < CCI_HEADER_SIZE or head[0x100:0x104] != b"NCSD":
+            raise ConvertError("CCI(NCSD) 헤더가 아닙니다.")
+        partitions: list[NcchPartition] = []
+        for index in range(NCSD_PARTITIONS):
+            entry = 0x120 + index * 8
+            units = int.from_bytes(head[entry:entry + 4], "little")
+            count = int.from_bytes(head[entry + 4:entry + 8], "little")
+            if not units or not count:
+                continue
+            offset = units * MEDIA_UNIT
+            declared = count * MEDIA_UNIT
+            if offset + 0x200 > total:
+                raise ConvertError("CCI 파티션 위치가 파일 크기를 넘어갑니다. 파일이 잘렸을 수 있어요.")
+            handle.seek(offset)
+            header = handle.read(0x200)
+            if len(header) < 0x200 or header[0x100:0x104] != NCCH_MAGIC:
+                raise ConvertError(f"CCI 파티션 {index}에서 NCCH 헤더를 찾지 못했습니다.")
+            content_units = int.from_bytes(header[0x104:0x108], "little")
+            size = (content_units * MEDIA_UNIT) or declared
+            size = min(max(size, 0x200), declared or size)
+            if offset + size > total:
+                raise ConvertError(f"CCI 파티션 {index}가 파일 끝을 넘어갑니다. 파일이 잘렸을 수 있어요.")
+            partitions.append(NcchPartition(index, offset, size, header))
+    return partitions
+
+
+def _ncch_ctr_base(header: bytes, section: int, section_start: int) -> int:
+    """GetNcchCtr와 같은 초기 카운터를 만든다.
+
+    version 1은 파티션 시작부터의 실제 오프셋을 카운터에 넣고,
+    그 밖(0/2)은 파티션 ID + 구간 번호 조합을 쓴다.
+    """
+    partition_id = header[0x108:0x110]
+    version = int.from_bytes(header[0x112:0x114], "little")
+    if version == 1:
+        return (int.from_bytes(partition_id, "big") << 64) | section_start
+    return (int.from_bytes(partition_id, "little") << 64) | (section << 56)
+
+
+def _seed_hash(seed: bytes, program_id: int) -> bytes:
+    return hashlib.sha256(seed + program_id.to_bytes(8, "little")).digest()[:4]
+
+
+def _pick_seed(header: bytes, keys: Keys) -> bytes | None:
+    """이 NCCH에 맞는 시드를 찾는다. 헤더의 hash_seed로 검증한다."""
+    program_id = int.from_bytes(header[0x118:0x120], "big")
+    seed = keys.seeds.get(program_id)
+    wanted = header[0x114:0x118]
+    if seed is not None and (not any(wanted) or _seed_hash(seed, program_id) == wanted):
+        return seed
+    if any(wanted):  # 제목이 달라도 해시가 맞는 시드가 있으면 쓴다
+        for candidate in keys.seeds.values():
+            if _seed_hash(candidate, program_id) == wanted:
+                return candidate
+    if seed is not None and not any(wanted):
+        return seed
+    if seed is not None:
+        raise ConvertError(
+            "keys.txt(또는 seeddb.bin)의 시드가 이 CCI와 맞지 않습니다.\n\n"
+            f"타이틀 0x{program_id:016X}의 시드를 다시 확인해 주세요."
+        )
+    return None
+
+
+def _read_decrypt(handle, partition: NcchPartition, part_range: _DecryptRange) -> bytes:
+    """파일에서 구간을 읽어 복호화한다(검증용)."""
+    handle.seek(partition.offset + part_range.offset)
+    data = handle.read(part_range.size)
+    if len(data) != part_range.size:
+        raise ConvertError("CCI를 읽는 도중에 끝났습니다. 파일이 잘렸을 수 있어요.")
+    return ctr_decrypt(part_range.key, part_range.ctr_base, part_range.ctr_offset, data)
+
+
+def _plan_partition(handle, partition: NcchPartition, keys: Keys) -> _PartitionPlan | None:
+    """한 파티션의 복호화 구간을 만들고 키가 맞는지 검증한다."""
+    header = partition.header
+    info = ncch_crypto_info(header)
+    if info.flags7 & 0x04:
+        return None  # 이미 복호화됨
+
+    if info.fixed_key:
+        if info.program_id & (0x10 << 32):
+            raise ConvertError(
+                "시스템 고정 키로 암호화된 타이틀이라 이 앱에서는 풀 수 없습니다."
+            )
+        key_menu = key_content = bytes(16)
+    else:
+        missing = [slot for slot in dict.fromkeys(info.key_slots) if slot not in keys.keyx]
+        if missing:
+            raise ConvertError(_need_keyx_message(missing))
+        if info.seed_crypto:
+            seed = _pick_seed(header, keys)
+            if seed is None:
+                raise ConvertError(_need_seed_message(info.program_id))
+            key_y_content = hashlib.sha256(header[0:16] + seed).digest()[:16]
+        else:
+            key_y_content = header[0:16]
+        key_menu = normal_key(keys.keyx[info.key_slots[0]], header[0:16])
+        key_content = normal_key(keys.keyx[info.key_slots[1]], key_y_content)
+
+    exefs_offset = int.from_bytes(header[0x1A0:0x1A4], "little") * MEDIA_UNIT
+    exefs_size = int.from_bytes(header[0x1A4:0x1A8], "little") * MEDIA_UNIT
+    romfs_offset = int.from_bytes(header[0x1B0:0x1B4], "little") * MEDIA_UNIT
+    romfs_size = int.from_bytes(header[0x1B4:0x1B8], "little") * MEDIA_UNIT
+    exthdr_size = int.from_bytes(header[0x180:0x184], "little")
+
+    ranges: list[_DecryptRange] = []
+    if exthdr_size:
+        exthdr = _DecryptRange(
+            0x200, 0x800, key_menu, _ncch_ctr_base(header, 1, 0x200), 0)
+        plain = _read_decrypt(handle, partition, exthdr)
+        if hashlib.sha256(plain[:0x400]).digest() != header[0x160:0x180]:
+            raise ConvertError(_wrong_key_message(info.program_id, "확장 헤더"))
+        ranges.append(exthdr)
+
+    if exefs_size:
+        base = _ncch_ctr_base(header, 2, exefs_offset)
+        exefs_head = _DecryptRange(exefs_offset, 0x200, key_menu, base, 0)
+        plain_head = _read_decrypt(handle, partition, exefs_head)
+        hash_units = int.from_bytes(header[0x1A8:0x1AC], "little")
+        if hash_units <= 1:  # 보통 1(0x200바이트)이다
+            if hashlib.sha256(plain_head).digest() != header[0x1C0:0x1E0]:
+                raise ConvertError(_wrong_key_message(info.program_id, "ExeFS 헤더"))
+        ranges.append(exefs_head)
+        for index in range(10):
+            entry = plain_head[index * 0x10:(index + 1) * 0x10]
+            name = entry[:8].rstrip(b"\x00")
+            file_offset = int.from_bytes(entry[8:12], "little")
+            file_size = int.from_bytes(entry[12:16], "little")
+            if not file_size:
+                continue
+            start = exefs_offset + 0x200 + file_offset
+            if start >= exefs_offset + exefs_size:
+                continue
+            file_size = min(file_size, exefs_offset + exefs_size - start)
+            key = key_menu if name.startswith((b"banner", b"icon")) else key_content
+            ranges.append(_DecryptRange(start, file_size, key, base, 0x200 + file_offset))
+            padding = _align(file_size, MEDIA_UNIT) - file_size
+            if padding > 0:
+                ranges.append(_DecryptRange(
+                    start + file_size, padding, key_menu, base,
+                    0x200 + file_offset + file_size))
+
+    if romfs_size:
+        base = _ncch_ctr_base(header, 3, romfs_offset)
+        first = _read_decrypt(
+            handle, partition,
+            _DecryptRange(romfs_offset, min(romfs_size, 0x200), key_content, base, 0))
+        if first[:4] != b"IVFC":
+            raise ConvertError(_wrong_key_message(info.program_id, "RomFS"))
+        hash_units = int.from_bytes(header[0x1B8:0x1BC], "little")
+        if hash_units == 1 and hashlib.sha256(first).digest() != header[0x1E0:0x200]:
+            raise ConvertError(_wrong_key_message(info.program_id, "RomFS"))
+        ranges.append(_DecryptRange(romfs_offset, romfs_size, key_content, base, 0))
+
+    patched = bytearray(header)
+    patched[0x18B] = 0  # ncchflag[3]
+    patched[0x18F] = (patched[0x18F] & ~0x21) | 0x04
+    return _PartitionPlan(partition, ranges, bytes(patched), info.seed_crypto)
+
+
+def _merge_ranges(ranges: list[_DecryptRange]) -> list[_DecryptRange]:
+    """겹치는 구간을 정리한다. 앞 구간을 자르고 빈 구간은 버린다."""
+    result: list[_DecryptRange] = []
+    for item in sorted(ranges, key=lambda rng: rng.offset):
+        if item.size <= 0:
+            continue
+        if result:
+            previous = result[-1]
+            end = previous.offset + previous.size
+            if item.offset < end:
+                previous.size = item.offset - previous.offset
+                if previous.size <= 0:
+                    result.pop()
+        result.append(item)
+    return result
+
+
+def decrypt_cci(src: Path, dst: Path, keys: Keys, log, progress=None) -> Path:
+    """암호화된 CCI를 복호화한 CCI로 새로 쓴다. NCSD 헤더는 그대로 둔다."""
+    partitions = read_ncsd(src)
+    total = src.stat().st_size
+    plans: list[_PartitionPlan] = []
+    with src.open("rb") as handle:
+        for partition in partitions:
+            plan = _plan_partition(handle, partition, keys)
+            if plan is None:
+                log(f"NCSD 파티션 {partition.index}: 이미 복호화되어 있음")
+                continue
+            plans.append(plan)
+            log(f"NCSD 파티션 {partition.index}: NCCH 암호 해제 준비"
+                + (" (시드 암호)" if plan.seed_crypto else ""))
+    if not plans:
+        raise ConvertError("이 CCI는 이미 복호화되어 있습니다.")
+
+    ranges: list[_DecryptRange] = []
+    patches: dict[int, bytes] = {}
+    for plan in plans:
+        base = plan.partition.offset
+        for part_range in plan.ranges:
+            size = min(part_range.size, plan.partition.size - part_range.offset)
+            if size <= 0:
+                continue
+            ranges.append(_DecryptRange(
+                base + part_range.offset, size, part_range.key,
+                part_range.ctr_base, part_range.ctr_offset))
+        patches[base] = plan.header_patch
+    ranges = _merge_ranges(ranges)
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    part = dst.with_name(dst.name + ".part")
+    part.unlink(missing_ok=True)
+    ciphers: list[tuple[int, CtrCipher]] = []
+    try:
+        with src.open("rb") as source, part.open("wb") as target:
+            position = 0
+            index = 0
+            while position < total:
+                chunk = source.read(min(CHUNK, total - position))
+                if not chunk:
+                    raise ConvertError("CCI를 읽는 도중에 끝났습니다. 파일이 잘렸을 수 있어요.")
+                buffer = bytearray(chunk)
+                end = position + len(chunk)
+
+                for patch_offset, patch in patches.items():
+                    patch_end = patch_offset + len(patch)
+                    if patch_end <= position or patch_offset >= end:
+                        continue
+                    left = max(position, patch_offset)
+                    right = min(end, patch_end)
+                    buffer[left - position:right - position] = \
+                        patch[left - patch_offset:right - patch_offset]
+
+                while index < len(ranges) and ranges[index].offset + ranges[index].size <= position:
+                    index += 1
+                cursor = index
+                while cursor < len(ranges) and ranges[cursor].offset < end:
+                    item = ranges[cursor]
+                    left = max(position, item.offset)
+                    right = min(end, item.offset + item.size)
+                    if right > left:
+                        cipher = _cipher_for(ciphers, cursor, item)
+                        offset = item.ctr_offset + (left - item.offset)
+                        buffer[left - position:right - position] = cipher.decrypt(
+                            offset, bytes(buffer[left - position:right - position]))
+                    cursor += 1
+
+                target.write(buffer)
+                position = end
+                if progress:
+                    progress(100.0 * position / max(total, 1))
+            if target.tell() != total:
+                raise ConvertError("CCI 복호화 결과 크기가 원본과 다릅니다.")
+        os.replace(part, dst)
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+    finally:
+        for _index, cipher in ciphers:
+            cipher.close()
+    log(f"CCI 암호 해제 완료: {dst.name} ({_size_text(dst.stat().st_size)})")
+    return dst
+
+
+def _cipher_for(ciphers: list[tuple[int, CtrCipher]], index: int,
+                item: _DecryptRange) -> CtrCipher:
+    for saved_index, cipher in ciphers:
+        if saved_index == index:
+            return cipher
+    cipher = CtrCipher(item.key, item.ctr_base)
+    ciphers.append((index, cipher))
+    return cipher
 
 
 # ------------------------------------------------------------- CIA parsing
@@ -413,9 +1023,10 @@ def _build_ncsd_header(ncch_head: bytes, ncch_size: int, total_size: int) -> byt
 
 
 def _patch_nocrypto(ncch_head: bytes) -> bytes:
-    """복호화한 내용이니 NCCH 헤더의 NoCrypto 플래그를 켠다."""
+    """복호화한 내용이니 NCCH 헤더의 암호 플래그를 정리한다."""
     fixed = bytearray(ncch_head)
-    fixed[0x18F] |= 0x04
+    fixed[0x18B] = 0  # ncchflag[3]
+    fixed[0x18F] = (fixed[0x18F] & ~0x21) | 0x04
     return bytes(fixed)
 
 
@@ -521,6 +1132,39 @@ def _need_key_message() -> str:
         "keys.txt 파일을 만들고 아래처럼 한 줄만 넣은 뒤, 롬 파일과 같은 폴더에 두세요.\n\n"
         "common: <32자리 16진수>\n\n"
         "키는 앱에 들어 있지 않습니다. 본인 콘솔에서 추출한 키를 쓰면 됩니다."
+    )
+
+
+def _need_keyx_message(slots: list[int]) -> str:
+    lines = [
+        "이 CCI는 암호화되어 있어서 NCCH 키(keyX)가 필요합니다.",
+        "",
+        "keys.txt에 아래 줄을 넣고 롬 파일과 같은 폴더에 두세요.",
+        "",
+    ]
+    for slot in slots:
+        lines.append(f"slot0x{slot:02X}KeyX: <32자리 16진수>")
+    lines += [
+        "",
+        "키는 앱에 들어 있지 않습니다. 본인 콘솔에서 추출한 키를 쓰면 됩니다.",
+    ]
+    return "\n".join(lines)
+
+
+def _need_seed_message(title_id: int) -> str:
+    return (
+        "이 CCI에는 시드 암호(seed crypto)가 걸려 있어서 시드가 필요합니다.\n\n"
+        "seeddb.bin을 롬 파일과 같은 폴더에 두거나, keys.txt에 아래 줄을 넣으세요.\n\n"
+        f"seed_{title_id:016X}: <32자리 16진수>\n\n"
+        "시드는 앱에 들어 있지 않습니다. 본인 콘솔에서 추출한 것을 쓰면 됩니다."
+    )
+
+
+def _wrong_key_message(title_id: int, section: str) -> str:
+    return (
+        f"{section}를 풀었는데 내용이 맞지 않습니다.\n\n"
+        f"타이틀 0x{title_id:016X}에 맞는 키(keyX/시드)인지 확인해 주세요. "
+        "콘솔에서 덤프한 원본 그대로인지도 같이 봐야 합니다."
     )
 
 
