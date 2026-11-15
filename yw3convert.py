@@ -291,12 +291,69 @@ def normal_key(key_x: bytes, key_y: bytes) -> bytes:
 # -------------------------------------------------------------------- keys
 
 
+COMMON_KEYX_SLOT = 0x3D
+COMMON_KEY_COUNT = 6
+
+
 @dataclass(frozen=True)
 class Keys:
+    """keys.txt에서 읽은 키 묶음.
+
+    common은 예전 형식(이름 없는 한 줄 또는 `common:`)으로 들어온 값이다.
+    요즘 덤프 도구의 `common0`~`common5`는 공통 키의 KeyY라서 그대로는 쓸 수
+    없고, `slot0x3DKeyX`와 키 스크램블러로 normal key를 만들어야 한다.
+    """
+
     common: bytes | None = None
     keyx: dict[int, bytes] = field(default_factory=dict)
     seeds: dict[int, bytes] = field(default_factory=dict)
     path: Path | None = None
+    common_keys: dict[int, bytes] = field(default_factory=dict)  # 인덱스별 normal key
+    common_y: dict[int, bytes] = field(default_factory=dict)  # 인덱스별 KeyY
+
+    def _derive_common(self, index: int) -> bytes | None:
+        key_y = self.common_y.get(index)
+        key_x = self.keyx.get(COMMON_KEYX_SLOT) or self.keyx.get(COMMON_KEYX_SLOT - 1)
+        if key_y is None or key_x is None:
+            return None
+        return normal_key(key_x, key_y)
+
+    def common_candidates(self, ticket_index: int | None = None) -> list[tuple[int | None, bytes]]:
+        """타이틀 키를 풀어 볼 common 키 후보를 우선순위대로 돌려준다.
+
+        티켓이 가리키는 인덱스를 먼저 보고, 그다음 나머지 후보를 본다.
+        어느 쪽이 맞는지는 실제 내용이 NCCH로 풀리는지로 확인한다.
+        """
+        ordered: list[tuple[int | None, bytes]] = []
+        seen: set[bytes] = set()
+
+        def add(index: int | None, key: bytes | None) -> None:
+            if key is None or len(key) != 16 or key in seen:
+                return
+            seen.add(key)
+            ordered.append((index, key))
+
+        def add_index(index: int) -> None:
+            add(index, self.common_keys.get(index))
+            add(index, self._derive_common(index))
+            # commonN을 normal key로 적어 둔 파일도 있어서 한 번 더 본다.
+            add(index, self.common_y.get(index))
+
+        if ticket_index is not None:
+            add_index(ticket_index)
+        add(None, self.common)
+        if self.common is not None:
+            key_x = self.keyx.get(COMMON_KEYX_SLOT) or self.keyx.get(COMMON_KEYX_SLOT - 1)
+            if key_x is not None:
+                add(None, normal_key(key_x, self.common))
+        for index in sorted(self.common_keys):
+            add_index(index)
+        for index in sorted(self.common_y):
+            add_index(index)
+        return ordered
+
+    def has_common(self) -> bool:
+        return bool(self.common or self.common_keys or self.common_y)
 
 
 def _parse_keyx_slot(name: str) -> int | None:
@@ -324,11 +381,37 @@ def _parse_seed_title(name: str) -> int | None:
     return int(match.group(0), 16)
 
 
+def _parse_common_slot(name: str) -> tuple[str, int | None] | None:
+    """'common0'/'common00'/'slot0x3DKey0'에서 (종류, 인덱스)를 뽑는다.
+
+    관행상 `common0`~`common5`는 KeyY, `common00`~`common05`와
+    `slot0x3DKey0`~`slot0x3DKey5`는 normal key다.
+    """
+    lowered = name.replace("_", "").replace("-", "").replace(" ", "")
+    match = re.match(r"^slot0x3dkey([0-9a-f])$", lowered)
+    if match:
+        return "normal", int(match.group(1), 16)
+    if not lowered.startswith("common"):
+        return None
+    suffix = lowered[len("common"):]
+    if not suffix:
+        return "legacy", None
+    if len(suffix) > 2 or any(char not in "0123456789abcdef" for char in suffix):
+        return "legacy", None
+    if len(suffix) == 1:
+        return "keyy", int(suffix, 16)
+    if suffix[0] == "0":
+        return "normal", int(suffix[1], 16)
+    return "normal", int(suffix, 16)
+
+
 def load_keys_file(path: Path) -> Keys:
     """keys.txt에서 common/keyX/seed를 읽는다.
 
     권장 형식:
-        common: <32 hex>
+        common: <32 hex>              (예전 형식, normal key로 취급)
+        slot0x3DKeyX: <32 hex>        (공통 키 KeyX)
+        common0: <32 hex>             (공통 키 0번 KeyY)
         slot0x2CKeyX: <32 hex>
         seed_00040000001AF400: <32 hex>
     """
@@ -340,6 +423,8 @@ def load_keys_file(path: Path) -> Keys:
     bare: bytes | None = None
     keyx: dict[int, bytes] = {}
     seeds: dict[int, bytes] = {}
+    common_keys: dict[int, bytes] = {}
+    common_y: dict[int, bytes] = {}
     for line in text.splitlines():
         line = line.split("#", 1)[0].strip()
         if not line:
@@ -352,8 +437,15 @@ def load_keys_file(path: Path) -> Keys:
         if len(value) != 32 or any(c not in "0123456789abcdefABCDEF" for c in value):
             continue
         data = bytes.fromhex(value)
-        if "common" in name:
-            common = common or data
+        common_slot = _parse_common_slot(name)
+        if common_slot is not None:
+            kind, index = common_slot
+            if kind == "keyy" and index is not None:
+                common_y.setdefault(index, data)
+            elif kind == "normal" and index is not None:
+                common_keys.setdefault(index, data)
+            else:
+                common = common or data
             continue
         slot = _parse_keyx_slot(name)
         if slot is not None:
@@ -365,7 +457,7 @@ def load_keys_file(path: Path) -> Keys:
             continue
         if not name and bare is None:
             bare = data
-    return Keys(common or bare, keyx, seeds, path)
+    return Keys(common or bare, keyx, seeds, path, common_keys, common_y)
 
 
 def find_keys(search_dirs: list[Path]) -> Keys:
@@ -380,19 +472,25 @@ def find_keys(search_dirs: list[Path]) -> Keys:
     common: bytes | None = None
     keyx: dict[int, bytes] = {}
     seeds: dict[int, bytes] = {}
+    common_keys: dict[int, bytes] = {}
+    common_y: dict[int, bytes] = {}
     found_path: Path | None = None
     for path in candidates:
         if not path.is_file():
             continue
         keys = load_keys_file(path)
-        if keys.common or keys.keyx or keys.seeds:
+        if keys.common or keys.common_keys or keys.common_y or keys.keyx or keys.seeds:
             found_path = found_path or path
         common = common or keys.common
         for slot, key in keys.keyx.items():
             keyx.setdefault(slot, key)
         for title_id, seed in keys.seeds.items():
             seeds.setdefault(title_id, seed)
-    return Keys(common, keyx, seeds, found_path)
+        for index, key in keys.common_keys.items():
+            common_keys.setdefault(index, key)
+        for index, key in keys.common_y.items():
+            common_y.setdefault(index, key)
+    return Keys(common, keyx, seeds, found_path, common_keys, common_y)
 
 
 # ----------------------------------------------------------- seeddb.bin
@@ -443,7 +541,7 @@ def load_keys(search_dirs: list[Path]) -> Keys:
         return keys
     merged = dict(seeds)
     merged.update(keys.seeds)
-    return Keys(keys.common, keys.keyx, merged, keys.path)
+    return Keys(keys.common, keys.keyx, merged, keys.path, keys.common_keys, keys.common_y)
 
 
 # --------------------------------------------------- CCI (NCSD) decryption
@@ -814,6 +912,7 @@ class CiaContent:
     size: int
     offset: int
     encrypted: bool
+    plaintext: bool = False  # TMD는 암호화라고 하는데 내용은 이미 평문인 경우
 
 
 @dataclass
@@ -827,6 +926,9 @@ class CiaInfo:
     content_area: int = 0
     title_key: bytes | None = None
     needs_key: bool = False
+    common_index: int | None = None
+    title_key_index: int | None = None
+    key_verified: bool = False
 
     @property
     def program(self) -> CiaContent | None:
@@ -852,6 +954,53 @@ def decrypt_title_key(encrypted: bytes, title_id: int, common_key: bytes) -> byt
 
 def _is_sig_type(value: int) -> bool:
     return 0x00010000 <= value <= 0x00010005
+
+
+def _ticket_common_index(ticket_data: bytes) -> int | None:
+    """티켓이 가리키는 common 키 인덱스(0~5). 없으면 None."""
+    if len(ticket_data) <= 0xB1:
+        return None
+    index = ticket_data[0xB1]
+    return index if index < COMMON_KEY_COUNT else None
+
+
+def _content_is_plaintext(raw: bytes) -> bool:
+    return len(raw) >= 0x104 and raw[0x100:0x104] == NCCH_MAGIC
+
+
+def _title_key_unlocks(raw: bytes, index: int, title_key: bytes) -> bool:
+    """이 타이틀 키로 내용 머리를 풀었을 때 NCCH가 나오는지 본다."""
+    if len(raw) < 0x200:
+        return False
+    plain = cbc_decrypt(title_key, _content_iv(index), raw[:0x200])
+    return plain[0x100:0x104] == NCCH_MAGIC
+
+
+def _find_title_key(encrypted_key: bytes, ticket_title: int, ticket_data: bytes,
+                    probe: tuple[int, bytes] | None,
+                    keys: Keys) -> tuple[bytes | None, int | None, bool]:
+    """common 키 후보를 차례로 대 보고 실제로 풀리는 것을 고른다.
+
+    keys.txt의 common0~common5는 KeyY인 경우가 많아서 그대로 쓰면 안 되고,
+    slot0x3DKeyX와 함께 normal key로 만들어야 한다. 어느 쪽이 맞는지는
+    내용 머리가 NCCH로 풀리는지로 확인한다.
+    """
+    candidates = keys.common_candidates(_ticket_common_index(ticket_data))
+    if not candidates:
+        return None, None, False
+    if probe is None:
+        # 내용이 너무 짧아 확인할 수 없으면 첫 후보를 그대로 쓴다.
+        index, common = candidates[0]
+        return decrypt_title_key(encrypted_key, ticket_title, common), index, False
+    content_index, raw = probe
+    for index, common in candidates:
+        try:
+            title_key = decrypt_title_key(encrypted_key, ticket_title, common)
+        except ConvertError:
+            continue
+        if _title_key_unlocks(raw, content_index, title_key):
+            return title_key, index, True
+    return None, None, False
 
 
 def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
@@ -924,13 +1073,30 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
     encrypted_key = ticket_data[0x7F:0x8F]
     ticket_title = int.from_bytes(ticket_data[0x9C:0xA4], "big")
 
+    # TMD는 암호화라고 적혀 있어도 실제 내용이 평문인 CIA가 있다(hshop 등).
+    # 먼저 내용 머리를 보고, 진짜 암호화된 구간만 키 확인에 쓴다.
+    probe: tuple[int, bytes] | None = None
+    encrypt_required = False
+    with path.open("rb") as handle:
+        for content in contents:
+            if not content.encrypted:
+                continue
+            handle.seek(content.offset)
+            raw = handle.read(min(0x400, content.size))
+            if _content_is_plaintext(raw):
+                content.plaintext = True
+                continue
+            encrypt_required = True
+            if probe is None and len(raw) >= 0x200:
+                probe = (content.index, raw)
+
+    needs_key = encrypt_required
     title_key: bytes | None = None
-    needs_key = any(item.encrypted for item in contents)
-    if needs_key and keys is not None and keys.common:
-        try:
-            title_key = decrypt_title_key(encrypted_key, ticket_title, keys.common)
-        except ConvertError:
-            title_key = None
+    title_key_index: int | None = None
+    key_verified = False
+    if needs_key and keys is not None:
+        title_key, title_key_index, key_verified = _find_title_key(
+            encrypted_key, ticket_title, ticket_data, probe, keys)
     return CiaInfo(
         header_size=header_size,
         title_id=title_id,
@@ -941,6 +1107,9 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
         content_area=content_area,
         title_key=title_key,
         needs_key=needs_key,
+        common_index=_ticket_common_index(ticket_data),
+        title_key_index=title_key_index,
+        key_verified=key_verified,
     )
 
 
@@ -999,7 +1168,7 @@ def decrypt_cia(src: Path, dst: Path, keys: Keys, progress=None) -> Path:
     if not info.needs_key:
         raise ConvertError("이 CIA는 이미 복호화되어 있습니다.")
     if not info.title_key:
-        raise ConvertError(_need_key_message())
+        raise ConvertError(_title_key_error(info, keys))
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     part = dst.with_name(dst.name + ".part")
@@ -1013,7 +1182,7 @@ def decrypt_cia(src: Path, dst: Path, keys: Keys, progress=None) -> Path:
         target.flush()
         with AesCbc(info.title_key) as cipher:
             for done, content in enumerate(info.contents):
-                if not content.encrypted:
+                if not content.encrypted or content.plaintext:
                     continue
                 _decrypt_in_place(target, content.offset, content.size, cipher,
                                   _content_iv(content.index), progress,
@@ -1095,7 +1264,7 @@ def cia_to_cci(src: Path, dst: Path, keys: Keys, log, progress=None,
     if not info.contents:
         raise ConvertError("CIA 안에 내용이 없습니다.")
     if info.needs_key and not info.title_key:
-        raise ConvertError(_need_key_message())
+        raise ConvertError(_title_key_error(info, keys))
 
     entries: list[tuple[CiaContent, bytes, bytes, int]] = []
     with src.open("rb") as source:
@@ -1104,12 +1273,16 @@ def cia_to_cci(src: Path, dst: Path, keys: Keys, log, progress=None,
             raw_head = source.read(0x400)
             if len(raw_head) < 0x400:
                 raise ConvertError("CIA 내용이 잘렸습니다.")
-            plain_head = (cbc_decrypt(info.title_key, _content_iv(content.index), raw_head)
-                          if content.encrypted else raw_head)
+            if content.encrypted and not content.plaintext:
+                plain_head = cbc_decrypt(info.title_key, _content_iv(content.index), raw_head)
+            else:
+                plain_head = raw_head
             if plain_head[0x100:0x104] != b"NCCH":
+                if content.encrypted and info.title_key:
+                    raise ConvertError(_wrong_common_message(info.title_id, info.common_index))
                 raise ConvertError(
                     f"CIA 내용 {content.index}에서 NCCH 헤더를 찾지 못했습니다. "
-                    "키가 맞는지 확인해 주세요.")
+                    "파일이 손상됐는지 확인해 주세요.")
             entries.append((content, _patch_nocrypto(plain_head), raw_head,
                             _cia_ncch_size(plain_head, content.size)))
 
@@ -1142,7 +1315,7 @@ def cia_to_cci(src: Path, dst: Path, keys: Keys, log, progress=None,
                 for content, plain_head, raw_head, size in entries:
                     target.write(plain_head)
                     body = max(content.size - len(raw_head), 0)
-                    if content.encrypted:
+                    if content.encrypted and not content.plaintext:
                         start_pct = 100.0 * (done + len(raw_head)) / max(total, 1)
                         end_pct = 100.0 * (done + len(raw_head) + body) / max(total, 1)
                         source.seek(content.offset + len(raw_head))
@@ -1222,9 +1395,36 @@ def ncch_to_cci(src: Path, dst: Path, log, progress=None) -> Path:
 def _need_key_message() -> str:
     return (
         "이 파일은 암호화되어 있어서 3DS 공통 키가 필요합니다.\n\n"
-        "keys.txt 파일을 만들고 아래처럼 한 줄만 넣은 뒤, 롬 파일과 같은 폴더에 두세요.\n\n"
-        "common: <32자리 16진수>\n\n"
+        "keys.txt 파일을 만들고 아래처럼 넣은 뒤, 롬 파일과 같은 폴더에 두세요.\n\n"
+        "common: <32자리 16진수>\n"
+        "slot0x3DKeyX: <32자리 16진수>\n"
+        "common0: <32자리 16진수>\n\n"
+        "덤프 도구가 만든 keys.txt에 common0~common5만 있고 slot0x3DKeyX가 없다면,\n"
+        "공통 키의 KeyY만 있는 상태라 normal key를 만들 수 없습니다.\n"
+        "slot0x3DKeyX도 같이 넣어 주세요.\n\n"
         "키는 앱에 들어 있지 않습니다. 본인 콘솔에서 추출한 키를 쓰면 됩니다."
+    )
+
+
+def _title_key_error(info: CiaInfo, keys: Keys) -> str:
+    """타이틀 키를 못 풀었을 때: 키가 아예 없는지, 있는데 안 맞는지 구분한다."""
+    if keys.has_common():
+        return _wrong_common_message(info.title_id, info.common_index)
+    return _need_key_message()
+
+
+def _wrong_common_message(title_id: int, common_index: int | None) -> str:
+    where = (f"이 CIA의 티켓은 common 키 {common_index}번을 가리킵니다.\n\n"
+             if common_index is not None else "")
+    return (
+        "CIA 안의 타이틀 키는 풀렸는데, 내용이 NCCH로 나오지 않습니다.\n"
+        "keys.txt의 common 키가 이 파일과 맞지 않는 것 같습니다.\n\n"
+        f"{where}"
+        "keys.txt에 common0~common5만 있다면 그건 공통 키의 KeyY입니다.\n"
+        "그대로는 쓸 수 없고 slot0x3DKeyX와 짝을 맞춰 normal key를 만들어야 합니다.\n"
+        "두 줄이 다 들어 있는지 확인해 주세요.\n\n"
+        f"타이틀 0x{title_id:016X}의 원본 CIA가 맞는지, 콘솔에서 덤프한 그대로인지도\n"
+        "같이 봐야 합니다. 중간에 손댄 파일이면 키가 맞아도 이렇게 나옵니다."
     )
 
 
