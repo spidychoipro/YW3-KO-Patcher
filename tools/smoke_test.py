@@ -27,8 +27,8 @@ import yw3ko_patcher as app  # noqa: E402
 import yw3convert as converter  # noqa: E402
 
 LOCAL_ZIP_CANDIDATES = [
-    Path(r"C:\Users\swpar\AppData\Local\Temp\opencode\yw3\YW3S_Korean_Patch_v1.0.zip"),
-    ROOT / "YW3S_Korean_Patch_v1.0.zip",
+    Path(r"C:\Users\swpar\AppData\Local\Temp\opencode\yw3\YW3S_Korean_Patch_v1.01.zip"),
+    ROOT / "YW3S_Korean_Patch_v1.01.zip",
 ]
 
 
@@ -717,7 +717,78 @@ def test_key_files(work: Path) -> None:
 
     merged = converter.load_keys([key_dir, seed_dir])
     assert merged.keyx[0x2C] == keyx_2c and merged.seeds[title_id] == seed, merged
+
+    other_dir = work / "other_keys"
+    other_dir.mkdir()
+    (other_dir / "keys.txt").write_text(
+        f"slot0x3DKey0: {keyx_2c.hex()}\n"
+        f"common01: {keyx_18.hex()}\n",
+        encoding="utf-8",
+    )
+    other = converter.load_keys_file(other_dir / "keys.txt")
+    assert other.common_keys[0] == keyx_2c, f"slot0x3DKey0: {other}"
+    assert other.common_keys[1] == keyx_18, f"common01: {other}"
     print("[ok] keys.txt keyX/seed 줄, seeddb.bin 병합")
+
+
+def test_common_key_derivation(work: Path) -> None:
+    """keys.txt의 common0(KeyY)와 slot0x3DKeyX로 normal key를 만드는지 확인한다."""
+    key_x = bytes.fromhex("617085719b7cfb316df4df2e8362c6e2")
+    key_y = bytes.fromhex("D07B337F9CA4385932A2E25723232EB9")
+    expected = bytes.fromhex("64c5fd55dd3ad988325baaec5243db98")
+    assert converter.normal_key(key_x, key_y) == expected, "공통 키 스크램블러 불일치"
+
+    key_dir = work / "common_keys"
+    key_dir.mkdir()
+    (key_dir / "keys.txt").write_text(
+        f"slot0x3DKeyX: {key_x.hex()}\ncommon0: {key_y.hex()}\n", encoding="utf-8")
+    parsed = converter.load_keys_file(key_dir / "keys.txt")
+    assert parsed.common_y[0] == key_y and parsed.keyx[0x3D] == key_x, parsed
+    candidates = parsed.common_candidates(0)
+    assert candidates and candidates[0] == (0, expected), candidates
+    assert parsed.has_common(), "common 키가 있다고 보지 않음"
+    print("[ok] common0(KeyY) + slot0x3DKeyX → normal key")
+
+    title_key = bytes.fromhex("00112233445566778899aabbccddeeff")
+    ncch = make_fake_ncch(app.YW3_BASE_TITLE, 0x8000)
+    cia = build_fake_cia(work / "keyy.cia", ncch, app.YW3_BASE_TITLE, title_key, expected, True)
+    info = converter.read_cia(cia, parsed)
+    assert info.key_verified and info.title_key_index == 0, info
+    assert info.title_key == title_key, "타이틀 키가 다름"
+
+    reference = converter.cia_to_cci(
+        build_fake_cia(work / "keyy_plain.cia", ncch, app.YW3_BASE_TITLE,
+                       title_key, expected, False),
+        work / "keyy_ref.cci", parsed, lambda m: None)
+    converted = converter.cia_to_cci(cia, work / "keyy.cci", parsed, lambda m: None)
+    assert converted.read_bytes() == reference.read_bytes(), "KeyY 경로 변환 결과가 다름"
+    print("[ok] KeyY만 있는 keys.txt로 암호화 CIA 변환")
+
+    wrong_dir = work / "wrong_keys"
+    wrong_dir.mkdir()
+    (wrong_dir / "keys.txt").write_text(
+        f"slot0x3DKeyX: {key_x.hex()}\ncommon0: {'22' * 16}\n", encoding="utf-8")
+    wrong = converter.load_keys([wrong_dir])
+    try:
+        converter.cia_to_cci(cia, work / "wrong.cci", wrong, lambda m: None)
+    except converter.ConvertError as exc:
+        assert "KeyY" in str(exc), str(exc)
+        print("[ok] 틀린 common 키는 KeyY 안내로 거부")
+    else:
+        raise AssertionError("틀린 키인데 변환이 됐다")
+
+    # TMD는 암호화라고 하는데 실제 내용은 평문인 CIA(hshop 등)
+    plain_flag = build_fake_cia(work / "plain_flag.cia", ncch, app.YW3_BASE_TITLE,
+                                title_key, expected, True)
+    stub = converter.read_cia(plain_flag)
+    with plain_flag.open("r+b") as handle:
+        handle.seek(stub.program.offset)
+        handle.write(ncch)
+    info = converter.read_cia(plain_flag, parsed)
+    assert info.needs_key is False, "평문 내용을 암호화로 봄"
+    converted = converter.cia_to_cci(plain_flag, work / "plain_flag.cci", parsed, lambda m: None)
+    assert converted.read_bytes() == reference.read_bytes(), "평문 플래그 CIA 변환 결과가 다름"
+    print("[ok] 암호화 플래그만 남은 평문 CIA도 변환")
 
 
 def test_convert_levels(work: Path) -> None:
@@ -963,6 +1034,7 @@ def main() -> int:
         test_rom_detection(work)
         test_converter(work)
         test_key_files(work)
+        test_common_key_derivation(work)
         test_ctr_stream(work)
         test_cci_decrypt(work)
         test_convert_levels(work)

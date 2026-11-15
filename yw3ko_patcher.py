@@ -33,12 +33,13 @@ from tkinter import filedialog, messagebox, ttk
 import yw3convert as converter
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
-RELEASE_TAG = "v1.0"
-PATCH_ZIP_NAME = "YW3S_Korean_Patch_v1.0.zip"
+RELEASE_TAG = "v1.01"
+PATCH_ZIP_NAME = "YW3S_Korean_Patch_v1.01.zip"
+PATCH_ZIP_SIZE = 82960189
 PATCH_ZIP_URL = f"https://github.com/{REPO}/releases/download/{RELEASE_TAG}/{PATCH_ZIP_NAME}"
 
 XDETTA_ZIP_URL = "https://github.com/jmacd/xdelta/releases/download/v3.2.2/xdelta3-3.2.2-windows-x86_64.zip"
@@ -68,7 +69,7 @@ class Role:
 BASE = Role(
     key="base",
     label="본편",
-    patch_name="YW3_Sukiyaki_KO_base_v1.0.xdelta",
+    patch_name="YW3_Sukiyaki_KO_base_v1.01.xdelta",
     patch_size=76459565,
     patch_sha256="b1cdc077367c198f13b34fd60330fc7f8972f8f175f3a53159093cb6807623c4",
     result_name="YW3_Sukiyaki_KO_base.cci",
@@ -79,12 +80,12 @@ BASE = Role(
 UPDATE = Role(
     key="update",
     label="업데이트",
-    patch_name="YW3_Sukiyaki_KO_update_v1.0.xdelta",
-    patch_size=12287076,
-    patch_sha256="e25a443c6b98f9558429299588ee35ef88158a81b3739a8431e0ffbcbdb98847",
+    patch_name="YW3_Sukiyaki_KO_update_v1.01.xdelta",
+    patch_size=12289902,
+    patch_sha256="ba4c16dfa2a8e581c2969f43e3e73851e4300dbeb550a6242c9e072dac0a55b6",
     result_name="YW3_Sukiyaki_KO_update4.cia",
-    result_size=196301824,
-    result_sha256="73adda215b3c929cca7cb0d544b686957ca7c4e2d354a77d9f342924d7a35453",
+    result_size=196305920,
+    result_sha256="d6b7c9a298790fbadff65782c82d17a183b1574d107529d054aa46a309bdb747",
 )
 ROLES = (BASE, UPDATE)
 
@@ -345,7 +346,7 @@ def ensure_patch(role: Role, log, progress=None) -> Path:
     archive = cache_dir() / PATCH_ZIP_NAME
     for attempt in (1, 2):
         if not archive.is_file():
-            log(f"한글 패치 v1.0 내려받는 중... ({human_size(82950210)} 내외, 처음 한 번만)")
+            log(f"한글 패치 v1.01 내려받는 중... ({human_size(PATCH_ZIP_SIZE)} 내외, 처음 한 번만)")
             download(PATCH_ZIP_URL, archive, progress)
             log("패치 압축 확인 중...")
         try:
@@ -750,8 +751,12 @@ class PatcherApp(tk.Tk):
 
         keys = converter.load_keys([base_path.parent, update_path.parent])
         hints: list[str] = []
-        if any(info.kind == "cia" and info.encrypted for info in infos) and not keys.common:
+        if any(info.kind == "cia" and info.encrypted for info in infos) and not keys.has_common():
             hints.append("· 암호화된 CIA를 풀려면 keys.txt의 common 키가 필요해요.")
+        if keys.common_y and not (keys.keyx.get(converter.COMMON_KEYX_SLOT)
+                                  or keys.keyx.get(converter.COMMON_KEYX_SLOT - 1)):
+            hints.append("· keys.txt의 common0~common5는 KeyY예요. "
+                         "slot0x3DKeyX도 같이 있어야 풀 수 있어요.")
         missing = sorted({slot for info in infos if info.encrypted
                           for slot in info.key_slots if slot not in keys.keyx})
         if missing:
@@ -848,7 +853,7 @@ class PatcherApp(tk.Tk):
         self._log(f"본편: {base}")
         self._log(f"업데이트: {update}")
         self._log(f"저장 위치: {out_dir}")
-        has_keys = bool(keys.common or keys.keyx or keys.seeds)
+        has_keys = bool(keys.has_common() or keys.keyx or keys.seeds)
         self._log(f"키 파일: {keys.path}" if has_keys else "키 파일: 없음 (암호화된 파일이면 필요해요)")
         if keys.seeds:
             self._log(f"시드: {len(keys.seeds)}개 준비됨")
