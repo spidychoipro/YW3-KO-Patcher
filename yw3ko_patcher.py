@@ -24,6 +24,7 @@ import threading
 import time
 import tkinter as tk
 import urllib.request
+import webbrowser
 import zipfile
 import zlib
 from dataclasses import dataclass
@@ -33,7 +34,7 @@ from tkinter import filedialog, messagebox, ttk
 import yw3convert as converter
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -49,6 +50,40 @@ XDETTA_EXE_SHA256 = "732980d52f9220dc81817ccdd0c295eadce8a0048a24c2a771a73f791ac
 
 CREATE_NO_WINDOW = 0x08000000
 HASH_BLOCK = 8 * 1024 * 1024
+
+KEY_DUMP_URL = "https://citra-emu.com/wiki/aes-keys/"
+GODMODE9_URL = "https://3ds.hacks.guide/godmode9-usage.html"
+
+KEY_HELP_TEXT = """암호화된 본편 CIA를 풀려면 콘솔에서 뽑은 키 파일이 필요합니다.
+앱에는 키가 들어 있지 않고, 내려받지도 않습니다.
+
+1. 3DS에 GodMode9이 설치되어 있어야 합니다.
+   커펌이 안 되어 있으면 3ds.hacks.guide 순서를 먼저 따라 하세요.
+
+2. Citra 키 덤프 스크립트(DumpKeys.gm9)를 내려받아
+   SD 카드의 gm9/scripts 폴더에 넣습니다.
+   아래 "키 덤프 스크립트 안내" 버튼으로 받을 수 있습니다.
+
+3. 3DS에서 GodMode9을 실행하고 HOME → Scripts → DumpKeys를 고릅니다.
+   최신 펌웨어(11.16/11.17) 기준이고, 끝나면 메뉴로 돌아옵니다.
+   "read fail"이 뜨면 GodMode9을 다른 방법으로 실행해서 다시 해보세요.
+
+4. SD 카드의 gm9/aes_keys.txt를 PC로 복사합니다.
+
+5. 그 파일을 롬 파일과 같은 폴더에 keys.txt 또는 aes_keys.txt 이름으로 두거나,
+   이 창을 닫고 "키 파일 (선택)" 칸에서 직접 고르면 됩니다.
+
+필요한 줄은 slot0x3DKeyX와 common0~common5입니다. 앱이 이 둘로 normal key를
+만들어서 CIA를 풉니다. aes_keys.txt에는 이 줄이 같이 들어 있습니다.
+common0~common5만 있고 slot0x3DKeyX가 없으면 풀 수 없으니, 덤프를 다시 하거나
+slot0x3DKeyX 줄을 같이 넣어 주세요.
+
+SD 카드를 빼기 싫으면 3DS에 ftpd를 설치하고 PC에서 FTP로 aes_keys.txt만
+받아도 됩니다. New 3DS는 무선 microSD 관리로도 접속됩니다.
+
+남의 콘솔에서 뽑은 파일은 이 콘솔의 CIA와 안 맞을 수 있습니다.
+본인 콘솔에서 뽑은 파일을 쓰세요.
+"""
 
 
 @dataclass(frozen=True)
@@ -180,8 +215,13 @@ def describe_rom(role_key: str, info: RomInfo) -> tuple[str, str]:
 
     if info.kind == "unknown":
         return f"{label}: 3DS 파일 형식을 알아보지 못했어요. 그대로 진행할 수 있어요.", "info"
+    if info.kind == "cci" and info.encrypted is None:
+        return (f"{label}: CCI인데 내부 NCCH 헤더를 찾지 못했어요. "
+                "헤더 모양이 달라도 내용이 맞으면 진행됩니다."), "info"
     if info.title_id is not None and info.title_id not in (YW3_BASE_TITLE, YW3_UPDATE_TITLE):
-        return f"{label}: 요괴워치3 스키야키 일본판이 아니에요 (타이틀 0x{info.title_id:016X}).", "warn"
+        return (f"{label}: 요괴워치3 스키야키 일본판이 아니에요 "
+                f"(타이틀 0x{info.title_id:016X}).\n"
+                "   그래도 시작은 눌러볼 수 있어요. 내용이 다르면 패치 단계에서 거부됩니다."), "warn"
     if role_key == "base" and info.title_id == YW3_UPDATE_TITLE:
         return f"{label} 자리에 업데이트가 들어간 것 같아요. 두 칸을 서로 바꿔 보세요.", "warn"
     if role_key == "update" and info.title_id == YW3_BASE_TITLE:
@@ -397,7 +437,8 @@ def _explain_mismatch(role: Role, bad: list[tuple[int, int]]) -> str:
         f"{role.label} 패치 결과가 공식 원본과 달라서 저장하지 않았습니다.\n\n"
         f"크기는 맞지만 내용이 다른 구간이 있어요: {ranges}\n\n"
         "요괴워치3 스키야키 일본판 v0이 맞는지 확인해 주세요. "
-        "본편 자리에 업데이트를 넣었거나, 다른 지역·버전 파일이면 이렇게 됩니다."
+        "본편 자리에 업데이트를 넣었거나, 다른 지역·버전 파일이면 이렇게 됩니다.\n"
+        "다른 도구로 CCI를 만들었다면, 변환 전 원본(CIA)을 그대로 넣어 보세요."
     )
 
 
@@ -470,7 +511,7 @@ def apply_patch(role: Role, source: Path, out_dir: Path, exe: Path, patch: Path,
                 for offset, length in bad:
                     if allow_header and offset < converter.CCI_HEADER_SIZE:
                         header_bad += 1
-                    elif padded_from is not None and offset >= padded_from:
+                    elif padded_from is not None and offset + length > padded_from:
                         padded_bad += 1
                     else:
                         hard.append((offset, length))
@@ -531,6 +572,21 @@ def _packed_end(path: Path) -> int:
     return max((item.offset + item.size for item in partitions), default=path.stat().st_size)
 
 
+def _pad_to_size(path: Path, target_size: int, dst: Path, log) -> Path:
+    """공식 카트리지보다 짧은 CCI를 target_size까지 0으로 채운 사본을 만든다.
+
+    다른 도구로 CIA를 CCI로 바꾸면 뒤쪽 빈 구간을 잘라내는 경우가 있다.
+    xdelta는 원본이 짧으면 복사할 위치를 못 찾아서 거부하므로 크기를 맞춘다.
+    """
+    size = path.stat().st_size
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(path, dst)
+    with dst.open("r+b") as handle:
+        handle.truncate(target_size)
+    log(f"[본편] 원본이 {human_size(size)}라서 {human_size(target_size)}까지 0으로 채움")
+    return dst
+
+
 def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys, log, status,
                    progress) -> PreparedSource:
     """패치에 쓸 파일을 준비한다. 필요하면 복호화·CCI 변환까지 한다."""
@@ -565,6 +621,16 @@ def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys,
                 result = converter.decrypt_cci(
                     path, work_dir / "base_decrypted.cci", keys, log, progress)
                 return PreparedSource(result, True, allow_header=True)
+            if info.kind == "cci":
+                # 밖에서 CIA를 CCI로 바꾼 파일은 헤더가 다르거나 뒤가 잘려 있을 수 있다.
+                # 크기를 맞춘 뒤 창 단위로 내용을 확인하므로 그대로 진행한다.
+                size = path.stat().st_size
+                if 0 < size < role.source_size:
+                    status("본편 CCI를 원본 크기에 맞추는 중...")
+                    padded = _pad_to_size(path, role.source_size,
+                                          work_dir / "base_padded.cci", log)
+                    return PreparedSource(padded, True, allow_header=True, padded_from=size)
+                return PreparedSource(path, True, allow_header=True)
         elif info.kind == "cia" and info.encrypted:
             status("업데이트 암호를 푸는 중...")
             log("[업데이트] 암호화된 CIA를 복호화합니다")
@@ -586,7 +652,8 @@ def _explain_failure(role: Role, returncode: int, raw: bytes) -> str:
             f"{text}\n\n"
             "일본판 요괴워치3 스키야키 v0인지 확인해 주세요. "
             "본편은 복호화 CCI나 CIA(hshop 본편 포함), 업데이트는 Update 4.0 CIA여야 합니다. "
-            "다른 지역판이나 다른 버전이면 크기·내용이 달라서 거부됩니다."
+            "다른 지역판이나 다른 버전이면 크기·내용이 달라서 거부됩니다.\n"
+            "다른 도구로 CCI를 만들었다면, 변환 전 원본(CIA)을 그대로 넣어 보세요."
         )
     return f"xdelta3 실행에 실패했습니다 (종료 코드 {returncode}).\n\n{text}"
 
@@ -595,7 +662,7 @@ class PatcherApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_NAME} v{APP_VERSION}")
-        self.geometry("800x560")
+        self.geometry("800x600")
         self.minsize(720, 520)
         self._queue: queue.Queue = queue.Queue()
         self._busy = False
@@ -640,15 +707,18 @@ class PatcherApp(tk.Tk):
         self.base_var = tk.StringVar()
         self.update_var = tk.StringVar()
         self.out_var = tk.StringVar()
+        self.keys_var = tk.StringVar()
         self.ready_var = tk.StringVar(value="본편 롬과 업데이트 파일을 골라 주세요.")
         self._add_file_row(files, 0, "① 본편 롬", self.base_var, self._pick_base)
         self._add_file_row(files, 1, "② 업데이트 파일", self.update_var, self._pick_update)
         self._add_file_row(files, 2, "③ 저장 위치", self.out_var, self._pick_out, folder=True)
+        self._add_file_row(files, 3, "키 파일 (선택)", self.keys_var, self._pick_keys)
         self.ready_label = ttk.Label(outer, textvariable=self.ready_var, style="Hint.TLabel",
                                      wraplength=760, justify="left")
         self.ready_label.grid(row=3, column=0, sticky="w", pady=(12, 0))
         self.base_var.trace_add("write", lambda *_: self._refresh())
         self.update_var.trace_add("write", lambda *_: self._refresh())
+        self.keys_var.trace_add("write", lambda *_: self._refresh())
 
         self.start_button = ttk.Button(
             outer, text="한글 패치 시작", style="Go.TButton", command=self._start, state="disabled")
@@ -664,6 +734,8 @@ class PatcherApp(tk.Tk):
         self.open_button = ttk.Button(actions, text="저장 폴더 열기", command=self._open_folder)
         self.log_button = ttk.Button(actions, text="진행 기록 보기", command=self._toggle_log)
         self.log_button.pack(side="left")
+        ttk.Button(actions, text="키 파일 안내", command=self._show_key_help).pack(
+            side="left", padx=(8, 0))
 
         self.log_frame = ttk.LabelFrame(outer, text=" 진행 기록 ", padding=(6, 4))
         self.log_frame.columnconfigure(0, weight=1)
@@ -682,7 +754,7 @@ class PatcherApp(tk.Tk):
             text="원본 파일은 그대로 두고 새 파일로 만들어요. 패치 파일은 제작팀 공식 배포처에서만 받습니다.",
             style="Hint.TLabel",
             wraplength=780,
-        ).grid(row=9, column=0, sticky="w", pady=(10, 0))
+        ).grid(row=10, column=0, sticky="w", pady=(10, 0))
 
     def _add_file_row(self, parent, row: int, label: str, var: tk.StringVar, command, folder=False) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
@@ -749,8 +821,11 @@ class PatcherApp(tk.Tk):
             has_warning = has_warning or level == "warn"
             lines.append(("✓ " if level == "ok" else "") + message)
 
-        keys = converter.load_keys([base_path.parent, update_path.parent])
+        keys = self._load_keys(base_path, update_path)
         hints: list[str] = []
+        chosen = self.keys_var.get().strip().strip('"')
+        if chosen and not Path(chosen).is_file():
+            hints.append("· 고른 키 파일을 찾을 수 없어요. 경로를 확인해 주세요.")
         if any(info.kind == "cia" and info.encrypted for info in infos) and not keys.has_common():
             hints.append("· 암호화된 CIA를 풀려면 keys.txt의 common 키가 필요해요.")
         if keys.common_y and not (keys.keyx.get(converter.COMMON_KEYX_SLOT)
@@ -770,7 +845,8 @@ class PatcherApp(tk.Tk):
         if hints:
             has_warning = True
             lines.extend(hints)
-            lines.append("· keys.txt와 seeddb.bin은 롬과 같은 폴더에 두면 자동으로 읽어요.")
+            lines.append("· 키 파일은 롬과 같은 폴더에 두거나 '키 파일 (선택)' 칸에서 고르세요.")
+            lines.append("· 만드는 법은 '키 파일 안내' 버튼에 있어요.")
         if has_warning:
             self._set_ready("\n".join(lines), "Warn.TLabel", True)
         else:
@@ -787,16 +863,16 @@ class PatcherApp(tk.Tk):
         if self.log_frame.winfo_manager():
             self.log_frame.grid_remove()
             self.log_button.configure(text="진행 기록 보기")
-            self._outer.rowconfigure(8, weight=0)
-            self.geometry("800x560")
+            self._outer.rowconfigure(9, weight=0)
+            self.geometry("800x600")
         else:
-            self._outer.rowconfigure(8, weight=1)
-            self.log_frame.grid(row=8, column=0, sticky="nsew", pady=(12, 0))
+            self._outer.rowconfigure(9, weight=1)
+            self.log_frame.grid(row=9, column=0, sticky="nsew", pady=(12, 0))
             self.log_button.configure(text="진행 기록 숨기기")
-            self.geometry("800x780")
+            self.geometry("800x820")
 
     def _center_window(self) -> None:
-        width, height = 800, 560
+        width, height = 800, 600
         x = max(0, (self.winfo_screenwidth() - width) // 2)
         y = max(0, (self.winfo_screenheight() - height) // 3)
         self.geometry(f"{width}x{height}+{x}+{y}")
@@ -806,6 +882,47 @@ class PatcherApp(tk.Tk):
         path = filedialog.askdirectory(title="결과를 저장할 폴더 선택", initialdir=initial)
         if path:
             self.out_var.set(path)
+
+    def _pick_keys(self) -> None:
+        path = filedialog.askopenfilename(
+            title="키 파일 선택 (keys.txt / aes_keys.txt)",
+            filetypes=[("키 파일", "*.txt *.bin"), ("모든 파일", "*.*")],
+        )
+        if path:
+            self.keys_var.set(path)
+
+    def _load_keys(self, base: Path, update: Path) -> converter.Keys:
+        """화면에서 고른 키 파일을 먼저 읽고, 없으면 롬 옆에서 찾는다."""
+        extra: list[Path] = []
+        text = self.keys_var.get().strip().strip('"')
+        if text and Path(text).is_file():
+            extra.append(Path(text))
+        return converter.load_keys([base.parent, update.parent], extra)
+
+    def _show_key_help(self) -> None:
+        window = tk.Toplevel(self)
+        window.title("키 파일(keys.txt) 만드는 법")
+        window.geometry("740x600")
+        window.transient(self)
+        frame = ttk.Frame(window, padding=14)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        text = tk.Text(frame, wrap="word", relief="flat", background="#fafafa",
+                       borderwidth=1, padx=10, pady=8)
+        text.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=scroll.set)
+        text.insert("1.0", KEY_HELP_TEXT)
+        text.configure(state="disabled")
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(buttons, text="키 덤프 스크립트 안내",
+                   command=lambda: webbrowser.open(KEY_DUMP_URL)).pack(side="left")
+        ttk.Button(buttons, text="GodMode9 설치 안내",
+                   command=lambda: webbrowser.open(GODMODE9_URL)).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="닫기", command=window.destroy).pack(side="left", padx=(8, 0))
 
     # ------------------------------------------------------------ control
     def _start(self) -> None:
@@ -837,13 +954,14 @@ class PatcherApp(tk.Tk):
             info = inspect_rom(path)
             if info.kind == "cia" or (path == base and info.kind == "ncch"):
                 needed += path.stat().st_size  # 변환/복호화 임시 파일
-            elif path == base and info.kind == "cci" and info.encrypted:
-                needed += path.stat().st_size  # 복호화한 CCI 임시 파일
+            elif path == base and info.kind == "cci" and (
+                    info.encrypted or path.stat().st_size < BASE.source_size):
+                needed += BASE.source_size  # 복호화하거나 크기를 채운 CCI 임시 파일
         free = shutil.disk_usage(out_dir).free
         if free < needed:
             self._log(f"저장 공간이 부족할 수 있습니다. 필요 약 {human_size(needed)}, 남은 공간 {human_size(free)}")
 
-        keys = converter.load_keys([base.parent, update.parent])
+        keys = self._load_keys(base, update)
         self._last_out_dir = out_dir
         self._set_busy(True)
         self.progress["value"] = 0

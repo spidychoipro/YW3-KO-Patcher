@@ -467,6 +467,9 @@ def find_keys(search_dirs: list[Path]) -> Keys:
     if override:
         candidates.append(Path(override))
     for folder in search_dirs:
+        if folder.is_file():
+            candidates.append(folder)
+            continue
         for name in KEYS_NAMES:
             candidates.append(folder / name)
     common: bytes | None = None
@@ -533,9 +536,13 @@ def find_seeds(search_dirs: list[Path]) -> dict[int, bytes]:
     return {}
 
 
-def load_keys(search_dirs: list[Path]) -> Keys:
-    """keys.txt와 seeddb.bin을 함께 읽는다. keys.txt의 시드가 우선한다."""
-    keys = find_keys(search_dirs)
+def load_keys(search_dirs: list[Path], extra_files: list[Path] | None = None) -> Keys:
+    """keys.txt와 seeddb.bin을 함께 읽는다. keys.txt의 시드가 우선한다.
+
+    extra_files는 사용자가 화면에서 직접 고른 키 파일이다. 폴더에서 찾은 것보다
+    먼저 읽어서 값이 겹치면 고른 파일 쪽을 쓴다.
+    """
+    keys = find_keys(list(extra_files or ()) + list(search_dirs))
     seeds = find_seeds(search_dirs)
     if not seeds:
         return keys
