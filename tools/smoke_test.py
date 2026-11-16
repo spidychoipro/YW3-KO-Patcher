@@ -141,8 +141,13 @@ def test_apply_roundtrip(exe: Path, work: Path) -> None:
 def test_gui() -> None:
     gui = app.PatcherApp()
     gui.update()
+    gui._show_key_help()
+    gui.update()
+    for child in gui.winfo_children():
+        if isinstance(child, app.tk.Toplevel):
+            child.destroy()
     gui.destroy()
-    print("[ok] GUI 생성/종료")
+    print("[ok] GUI 생성/종료, 키 안내 창")
 
 
 def test_gui_flow(exe: Path, work: Path) -> None:
@@ -318,6 +323,12 @@ def test_ui_states(work: Path) -> None:
         gui.update()
         assert "CIA" in gui.ready_var.get(), gui.ready_var.get()
         assert str(gui.start_button["state"]) == "normal", "경고 상황에서도 시작은 가능해야 함"
+
+        gui.keys_var.set(str(work / "없는키.txt"))
+        gui.update()
+        assert "고른 키 파일" in gui.ready_var.get(), gui.ready_var.get()
+        gui.keys_var.set("")
+        gui.update()
 
         gui._toggle_log()
         gui.update()
@@ -790,6 +801,15 @@ def test_common_key_derivation(work: Path) -> None:
     assert converted.read_bytes() == reference.read_bytes(), "평문 플래그 CIA 변환 결과가 다름"
     print("[ok] 암호화 플래그만 남은 평문 CIA도 변환")
 
+    picked = work / "picked_keys.txt"
+    picked.write_text(f"slot0x3DKeyX: {key_x.hex()}\ncommon0: {key_y.hex()}\n",
+                      encoding="utf-8")
+    empty = work / "empty_keys_dir"
+    empty.mkdir(exist_ok=True)
+    chosen = converter.load_keys([empty], [picked])
+    assert chosen.has_common() and chosen.path == picked, chosen
+    print("[ok] 화면에서 고른 키 파일을 폴더 없이 바로 읽음")
+
 
 def test_convert_levels(work: Path) -> None:
     """변환 대상 파일이 경고가 아니라 '변환해서 진행' 안내로 보이는지 확인한다."""
@@ -864,6 +884,45 @@ def test_prepare_pipeline(exe: Path, work: Path) -> None:
     assert result.read_bytes() == bytes(data), "패치 결과가 다름"
     assert report.get("verified") is True, "지문 검증이 통과로 기록되지 않음"
     print("[ok] 변환본 → 패치 → 지문 검증")
+
+
+def test_trimmed_cci(exe: Path, work: Path) -> None:
+    """다른 도구가 뒤쪽 빈 구간을 잘라낸 CCI도 크기를 맞춰 패치하는지 확인한다."""
+    reference = make_fake_cci(work, "trim_ref.cci", app.YW3_BASE_TITLE, encrypted=False)
+    data = bytearray(reference.read_bytes())
+    data[0x300:0x310] = b"korean patch!!! "
+    target = work / "trim_target.cci"
+    target.write_bytes(bytes(data))
+    diff = work / "trim.xdelta"
+    app.subprocess.run([str(exe), "-e", "-f", "-s", str(reference), str(target), str(diff)],
+                       capture_output=True, check=True)
+
+    trimmed = work / "trim_input.cci"
+    trimmed.write_bytes(reference.read_bytes()[:0x1000])
+    role = app.Role(
+        key="base", label="본편", patch_name=diff.name, patch_size=diff.stat().st_size,
+        patch_sha256=sha256_bytes(diff.read_bytes()), result_name="trim_out.cci",
+        result_size=target.stat().st_size, result_sha256=sha256_bytes(target.read_bytes()),
+        source_size=reference.stat().st_size,
+    )
+    prepared = app.prepare_source(
+        role, trimmed, work, converter.Keys(),
+        lambda m: None, lambda s: None, lambda p: None)
+    assert prepared.converted and prepared.padded_from == 0x1000, prepared
+    assert prepared.path.stat().st_size == reference.stat().st_size, "원본 크기로 못 채움"
+
+    out_dir = work / "trim_out"
+    out_dir.mkdir()
+    report: dict = {}
+    result = app.apply_patch(
+        role, prepared.path, out_dir, exe, diff, True, True,
+        lambda m: None, lambda p: None, lambda s: None,
+        strict=False, report=report, allow_header=prepared.allow_header,
+        padded_from=prepared.padded_from)
+    assert result.read_bytes() == target.read_bytes(), "자른 CCI 패치 결과가 다름"
+    assert report.get("verified") is True, report
+    print("[ok] 뒤가 잘린 CCI는 0으로 채워 패치")
+
 
 
 def build_multi_cia(path: Path, contents: list[bytes], title_id: int, title_key: bytes,
@@ -1039,6 +1098,7 @@ def main() -> int:
         test_cci_decrypt(work)
         test_convert_levels(work)
         test_prepare_pipeline(exe, work)
+        test_trimmed_cci(exe, work)
         test_multi_content(work)
         test_window_verify(exe, work)
         test_ui_states(work)
