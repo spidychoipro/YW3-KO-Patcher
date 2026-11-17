@@ -32,9 +32,10 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import yw3convert as converter
+import yw3profile as profiles
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.4"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -437,8 +438,10 @@ def _explain_mismatch(role: Role, bad: list[tuple[int, int]]) -> str:
         f"{role.label} 패치 결과가 공식 원본과 달라서 저장하지 않았습니다.\n\n"
         f"크기는 맞지만 내용이 다른 구간이 있어요: {ranges}\n\n"
         "요괴워치3 스키야키 일본판 v0이 맞는지 확인해 주세요. "
-        "본편 자리에 업데이트를 넣었거나, 다른 지역·버전 파일이면 이렇게 됩니다.\n"
-        "다른 도구로 CCI를 만들었다면, 변환 전 원본(CIA)을 그대로 넣어 보세요."
+        "본편 자리에 업데이트를 넣었거나, 다른 지역·버전 파일이면 이렇게 됩니다. "
+        "이미 한글 패치한 파일을 원본으로 넣어도 이렇게 나옵니다.\n"
+        "0xC3000처럼 8MB 안쪽에서 막히면 ExeFS(실행 코드)가 원본과 다른 경우가 많아요. "
+        "다른 도구로 CCI를 만들었다면 변환 전 원본(CIA)을 그대로 넣어 보세요."
     )
 
 
@@ -572,6 +575,170 @@ def _packed_end(path: Path) -> int:
     return max((item.offset + item.size for item in partitions), default=path.stat().st_size)
 
 
+@dataclass(frozen=True)
+class _ActualPart:
+    index: int
+    offset: int
+    size: int
+    header: bytes
+
+
+_REGION_NAMES = {
+    "exheader": "확장 헤더",
+    "plain": "평문",
+    "logo": "로고",
+    "exefs": "ExeFS",
+    "romfs": "RomFS",
+}
+
+
+def _actual_parts(path: Path, keys: converter.Keys) -> list[_ActualPart]:
+    """CCI/CIA/NCCH에서 NCCH 파티션 목록과 각 헤더를 읽는다."""
+    parts: list[_ActualPart] = []
+    with path.open("rb") as handle:
+        head = handle.read(0x400)
+        if len(head) >= 0x104 and head[0x100:0x104] == b"NCSD":
+            for item in converter.read_ncsd(path):
+                parts.append(_ActualPart(item.index, item.offset, item.size, item.header))
+            return parts
+
+        if len(head) >= 4 and head[:4] == b"\x20\x20\x00\x00":
+            info = converter.read_cia(path, keys)
+            for content in info.contents:
+                handle.seek(content.offset)
+                header = handle.read(0x200)
+                if len(header) == 0x200 and header[0x100:0x104] == b"NCCH":
+                    parts.append(_ActualPart(content.index, content.offset,
+                                             content.size, header))
+            return parts
+
+        if len(head) >= 0x200 and head[0x100:0x104] == b"NCCH":
+            parts.append(_ActualPart(0, 0, path.stat().st_size, head[:0x200]))
+    return parts
+
+
+def _hash_at(handle, offset: int, size: int) -> str:
+    handle.seek(offset)
+    digest = hashlib.sha256()
+    remaining = size
+    while remaining > 0:
+        block = handle.read(min(HASH_BLOCK, remaining))
+        if not block:
+            raise PatchError("원본을 읽는 도중에 끝났습니다. 파일이 잘렸을 수 있어요.")
+        digest.update(block)
+        remaining -= len(block)
+    return digest.hexdigest().lower()
+
+
+def check_source_profile(path: Path, role: Role, keys: converter.Keys,
+                         log, status, padded_from: int | None = None) -> list[str]:
+    """원본의 게임 영역 해시를 공식 manifest와 비교한다.
+
+    돌려주는 목록이 비어 있으면 통과다. 문제가 있으면 어떤 영역이 왜 다른지
+    사람이 읽을 수 있는 문장으로 돌려준다.
+    """
+    profile = profiles.PROFILES.get(role.key)
+    if profile is None:
+        return []
+    try:
+        actual_parts = _actual_parts(path, keys)
+    except (converter.ConvertError, OSError) as exc:
+        return [f"파일 구조를 읽지 못했습니다: {exc}"]
+
+    by_index = {part.index: part for part in actual_parts}
+    issues: list[str] = []
+    status(f"{role.label} 원본이 공식 배포본과 같은지 확인하는 중...")
+    log(f"[{role.label}] 게임 영역 해시를 공식 manifest와 대조합니다")
+
+    with path.open("rb") as handle:
+        for expected in profile.parts:
+            main_part = expected.index == 0
+            actual = by_index.get(expected.index)
+            if actual is None:
+                if not main_part or padded_from is not None:
+                    why = ("뒤쪽이 잘린 원본" if padded_from is not None
+                           else "설명서/추가 파티션")
+                    log(f"[{role.label}] 파티션 {expected.index}는 없음({why}), 건너뜁니다")
+                    continue
+                issues.append(f"파티션 {expected.index}가 없습니다")
+                continue
+
+            header = actual.header
+            program_id = int.from_bytes(header[0x118:0x120], "big")
+            product = header[0x150:0x160].rstrip(b"\x00").decode("ascii", "replace")
+            soft: list[str] = []
+            if program_id != expected.program_id:
+                soft.append(
+                    f"파티션 {expected.index}의 프로그램 ID가 다릅니다 "
+                    f"(0x{program_id:016X}, 공식 0x{expected.program_id:016X})")
+            if product and product != expected.product_code:
+                soft.append(
+                    f"파티션 {expected.index}의 제품 코드가 다릅니다 "
+                    f"({product}, 공식 {expected.product_code})")
+
+            regions = {region.name: region for region in converter.ncch_regions(header)}
+            for wanted in expected.regions:
+                name = _REGION_NAMES.get(wanted.name, wanted.name)
+                found = regions.get(wanted.name)
+                if found is None:
+                    soft.append(f"{name} 영역이 없습니다")
+                    continue
+                if found.size != wanted.size:
+                    soft.append(
+                        f"{name} 크기가 다릅니다 "
+                        f"({human_size(found.size)}, 공식 {human_size(wanted.size)})")
+                    continue
+                absolute = actual.offset + found.offset
+                if absolute + found.size > path.stat().st_size:
+                    log(f"[{role.label}] {name}는 파일 끝을 넘어서 건너뜁니다")
+                    continue
+                if padded_from is not None and absolute + found.size > padded_from:
+                    log(f"[{role.label}] {name}는 잘린 뒤쪽 구간이라 건너뜁니다")
+                    continue
+                if issues and wanted.name == "romfs":
+                    # 이미 앞쪽 영역에서 틀린 게 나왔으면 3GB를 더 읽지 않는다.
+                    log(f"[{role.label}] 앞 영역이 이미 달라서 {name} 확인은 건너뜁니다")
+                    continue
+                log(f"[{role.label}] {name} 확인 중...")
+                digest = _hash_at(handle, absolute, found.size)
+                if digest != wanted.sha256:
+                    soft.append(f"{name} 내용이 공식 원본과 다릅니다")
+
+            if main_part:
+                issues.extend(soft)
+            else:
+                # 설명서/DLP 같은 곁다리 파티션은 본편 패치와 상관없다.
+                for line in soft:
+                    log(f"[{role.label}] 참고: {line} (본편에는 영향 없음)")
+
+    if not issues:
+        log(f"[{role.label}] 게임 영역 해시가 공식 원본과 일치합니다")
+    return issues
+
+
+def _profile_error(role: Role, issues: list[str]) -> str:
+    lines = [
+        f"{role.label} 원본이 공식 배포본(v0)과 다릅니다.",
+        "",
+    ]
+    lines += [f"- {issue}" for issue in issues]
+    lines += [
+        "",
+        "이 상태로 패치하면 일부 구간이 원본과 섞여서 게임이 깨질 수 있어 저장하지 않았습니다.",
+    ]
+    if any("ExeFS" in issue for issue in issues):
+        lines.append(
+            "ExeFS가 다르면 0xC3000 같은 안쪽 오프셋에서 막히는 것처럼 보입니다. "
+            "다른 버전이거나, 변환 도구가 ExeFS를 제대로 복호화하지 못한 파일일 수 있어요.")
+    lines += [
+        "",
+        "본편은 일본판 요괴워치3 스키야키 v0 복호화 CCI 또는 hshop 본편 CIA를, "
+        "업데이트는 Update 4.0 복호화/암호화 CIA를 넣어 주세요. "
+        "이미 한글 패치한 파일을 원본 칸에 넣으면 이렇게 됩니다.",
+    ]
+    return "\n".join(lines)
+
+
 def _pad_to_size(path: Path, target_size: int, dst: Path, log) -> Path:
     """공식 카트리지보다 짧은 CCI를 target_size까지 0으로 채운 사본을 만든다.
 
@@ -587,10 +754,26 @@ def _pad_to_size(path: Path, target_size: int, dst: Path, log) -> Path:
     return dst
 
 
+def _finish(role: Role, prepared: PreparedSource, keys: converter.Keys,
+            log, status) -> PreparedSource:
+    """준비한 원본이 공식 배포본과 같은 데이터인지 확인하고 넘긴다."""
+    issues = check_source_profile(
+        prepared.path, role, keys, log, status, prepared.padded_from)
+    if issues:
+        raise PatchError(_profile_error(role, issues))
+    return prepared
+
+
 def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys, log, status,
-                   progress) -> PreparedSource:
+                   progress, check_profile: bool = True) -> PreparedSource:
     """패치에 쓸 파일을 준비한다. 필요하면 복호화·CCI 변환까지 한다."""
     info = inspect_rom(path)
+
+    def finish(prepared: PreparedSource) -> PreparedSource:
+        if not check_profile:
+            return prepared
+        return _finish(role, prepared, keys, log, status)
+
     try:
         if role.key == "base":
             if info.kind == "cia":
@@ -601,7 +784,8 @@ def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys,
                     min_size=role.source_size)
                 real_end = _packed_end(target)
                 padded = real_end if real_end < target.stat().st_size else None
-                return PreparedSource(target, True, allow_header=True, padded_from=padded)
+                return finish(PreparedSource(
+                    target, True, allow_header=True, padded_from=padded))
             if info.kind == "ncch":
                 if info.encrypted:
                     status("본편 NCCH 암호를 푸는 중...")
@@ -610,33 +794,50 @@ def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys,
                         path, work_dir / "base_from_ncch.cci", log, progress)
                     result = converter.decrypt_cci(
                         wrapped, work_dir / "base_decrypted.cci", keys, log, progress)
-                    return PreparedSource(result, True, allow_header=True)
+                    return finish(PreparedSource(result, True, allow_header=True))
                 status("본편 NCCH를 CCI로 감싸는 중...")
                 log("[본편] NCCH를 CCI로 감쌉니다")
                 result = converter.ncch_to_cci(path, work_dir / "base_from_ncch.cci", log, progress)
-                return PreparedSource(result, True, allow_header=True)
+                return finish(PreparedSource(result, True, allow_header=True))
             if info.encrypted:
                 status("본편 CCI 암호를 푸는 중...")
                 log(f"[본편] 암호화된 CCI의 NCCH 암호를 풉니다 ({human_size(path.stat().st_size)})")
                 result = converter.decrypt_cci(
                     path, work_dir / "base_decrypted.cci", keys, log, progress)
-                return PreparedSource(result, True, allow_header=True)
+                return finish(PreparedSource(result, True, allow_header=True))
             if info.kind == "cci":
                 # 밖에서 CIA를 CCI로 바꾼 파일은 헤더가 다르거나 뒤가 잘려 있을 수 있다.
                 # 크기를 맞춘 뒤 창 단위로 내용을 확인하므로 그대로 진행한다.
+                bad = converter.check_plaintext_cci(path)
+                if bad and keys.keyx:
+                    status("본편 CCI 내용이 실제로는 암호화되어 있어 다시 푸는 중...")
+                    log(f"[본편] 헤더는 복호화됐다고 되어 있지만 "
+                        f"{', '.join(bad)} 내용이 암호화 상태임. 키로 다시 풉니다")
+                    try:
+                        result = converter.decrypt_cci(
+                            path, work_dir / "base_redecrypted.cci", keys, log, progress)
+                        return finish(PreparedSource(result, True, allow_header=True))
+                    except converter.ConvertError as exc:
+                        log(f"[본편] 다시 풀지 못했습니다: {exc}")
+                elif bad:
+                    log(f"[본편] {', '.join(bad)} 내용이 평문으로 확인되지 않지만 "
+                        "키가 없어서 다시 풀지 않습니다")
                 size = path.stat().st_size
                 if 0 < size < role.source_size:
                     status("본편 CCI를 원본 크기에 맞추는 중...")
                     padded = _pad_to_size(path, role.source_size,
                                           work_dir / "base_padded.cci", log)
-                    return PreparedSource(padded, True, allow_header=True, padded_from=size)
-                return PreparedSource(path, True, allow_header=True)
-        elif info.kind == "cia" and info.encrypted:
-            status("업데이트 암호를 푸는 중...")
-            log("[업데이트] 암호화된 CIA를 복호화합니다")
-            result = converter.decrypt_cia(
-                path, work_dir / "update_decrypted.cia", keys, progress)
-            return PreparedSource(result, True)
+                    return finish(PreparedSource(
+                        padded, True, allow_header=True, padded_from=size))
+                return finish(PreparedSource(path, True, allow_header=True))
+        elif info.kind == "cia":
+            if info.encrypted:
+                status("업데이트 암호를 푸는 중...")
+                log("[업데이트] 암호화된 CIA를 복호화합니다")
+                result = converter.decrypt_cia(
+                    path, work_dir / "update_decrypted.cia", keys, progress)
+                return finish(PreparedSource(result, True))
+            return finish(PreparedSource(path, False))
     except converter.ConvertError as exc:
         raise PatchError(str(exc)) from exc
     return PreparedSource(path, False)
@@ -971,10 +1172,8 @@ class PatcherApp(tk.Tk):
         self._log(f"본편: {base}")
         self._log(f"업데이트: {update}")
         self._log(f"저장 위치: {out_dir}")
-        has_keys = bool(keys.has_common() or keys.keyx or keys.seeds)
-        self._log(f"키 파일: {keys.path}" if has_keys else "키 파일: 없음 (암호화된 파일이면 필요해요)")
-        if keys.seeds:
-            self._log(f"시드: {len(keys.seeds)}개 준비됨")
+        for line in keys.summary():
+            self._log(line)
         for role_key, path in (("base", base), ("update", update)):
             self._log(describe_rom(role_key, inspect_rom(path))[0])
         threading.Thread(target=self._worker, args=(base, update, out_dir, keys), daemon=True).start()
