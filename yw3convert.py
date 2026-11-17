@@ -1213,13 +1213,15 @@ def _title_key_unlocks(raw: bytes, index: int, title_key: bytes) -> bool:
 
 
 def _find_title_key(encrypted_key: bytes, ticket_title: int, tmd_title: int,
-                    ticket_data: bytes, probe: tuple[int, bytes] | None,
+                    ticket_data: bytes, probes: list[tuple[int, bytes]] | None,
                     keys: Keys) -> tuple[bytes | None, int | None, bool, int, str]:
     """타이틀 키 후보를 차례로 대 보고 실제로 풀리는 것을 고른다.
 
     - 티켓의 타이틀 키가 이미 평문인 CIA도 있어서 그것부터 본다.
     - common0~common5는 KeyY인 경우가 많아 slot0x3DKeyX와 짝을 맞춘다.
     - 티켓 타이틀 ID와 TMD 타이틀 ID가 다른 CIA도 있어서 둘 다 시도한다.
+    - 암호화된 내용이 여러 개면 하나라도 풀리는 키를 찾는다. 첫 내용이
+      깨져 있어도 다른 내용으로 키를 확인할 수 있다.
     - 0으로 채워진 키는 후보에서 뺀다.
     """
     candidates: list[tuple[bytes, int | None, str]] = []
@@ -1248,14 +1250,14 @@ def _find_title_key(encrypted_key: bytes, ticket_title: int, tmd_title: int,
 
     if not candidates:
         return None, None, False, 0, ""
-    if probe is None:
+    if not probes:
         # 내용이 너무 짧아 확인할 수 없으면 첫 후보를 그대로 쓴다.
         key, index, origin = candidates[0]
         return key, index, False, len(candidates), origin
-    content_index, raw = probe
     for key, index, origin in candidates:
-        if _title_key_unlocks(raw, content_index, key):
-            return key, index, True, len(candidates), origin
+        for content_index, raw in probes:
+            if _title_key_unlocks(raw, content_index, key):
+                return key, index, True, len(candidates), origin
     return None, None, False, len(candidates), ""
 
 
@@ -1331,7 +1333,7 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
 
     # TMD는 암호화라고 적혀 있어도 실제 내용이 평문인 CIA가 있다(hshop 등).
     # 먼저 내용 머리를 보고, 진짜 암호화된 구간만 키 확인에 쓴다.
-    probe: tuple[int, bytes] | None = None
+    probes: list[tuple[int, bytes]] = []
     encrypt_required = False
     with path.open("rb") as handle:
         for content in contents:
@@ -1343,8 +1345,8 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
                 content.plaintext = True
                 continue
             encrypt_required = True
-            if probe is None and len(raw) >= 0x200:
-                probe = (content.index, raw)
+            if len(raw) >= 0x200:
+                probes.append((content.index, raw))
 
     needs_key = encrypt_required
     title_key: bytes | None = None
@@ -1355,7 +1357,7 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
     if needs_key and keys is not None:
         title_key, title_key_index, key_verified, key_candidates, title_key_origin = \
             _find_title_key(
-                encrypted_key, ticket_title, title_id, ticket_data, probe, keys)
+                encrypted_key, ticket_title, title_id, ticket_data, probes, keys)
 
     bad_contents: list[int] = []
     if title_key is not None:
@@ -1557,8 +1559,10 @@ def cia_to_cci(src: Path, dst: Path, keys: Keys, log, progress=None,
             else:
                 plain_head = raw_head
             if plain_head[0x100:0x104] != b"NCCH":
-                if content.encrypted and info.title_key:
-                    raise ConvertError(_wrong_common_message(info.title_id, info.common_index))
+                if content.encrypted:
+                    if info.key_verified:
+                        raise ConvertError(_content_broken_message(info, content.index))
+                    raise ConvertError(_title_key_error(info, keys))
                 raise ConvertError(
                     f"CIA 내용 {content.index}에서 NCCH 헤더를 찾지 못했습니다. "
                     "파일이 손상됐는지 확인해 주세요.")
@@ -1688,10 +1692,20 @@ def _need_key_message() -> str:
 def _bad_content_message(info: CiaInfo) -> str:
     indices = ", ".join(str(index) for index in info.bad_contents)
     return (
-        "CIA의 타이틀 키는 풀렸는데 일부 내용이 NCCH로 나오지 않습니다.\n"
+        "CIA의 타이틀 키는 다른 내용에서 확인됐는데, 일부 내용이 NCCH로 나오지 않습니다.\n"
         f"문제가 된 내용 번호: {indices}\n\n"
-        "내용마다 다른 키를 쓰는 파일이거나, 중간이 손상된 CIA일 수 있습니다.\n"
+        "키가 틀린 게 아니라 이 내용이 손상됐거나 중간에 바뀐 것 같습니다. "
         "콘솔에서 덤프한 원본 CIA인지 확인하고, 가능하면 다시 덤프해 보세요."
+    )
+
+
+def _content_broken_message(info: CiaInfo, content_index: int) -> str:
+    return (
+        "CIA의 타이틀 키는 다른 내용에서 확인됐는데, "
+        f"내용 {content_index}만 NCCH로 나오지 않습니다.\n\n"
+        "keys.txt의 common 키 문제가 아니라 이 내용이 손상됐거나 중간에 바뀐 것 같습니다. "
+        f"타이틀 0x{info.title_id:016X}의 원본 CIA인지 확인하고, "
+        "가능하면 콘솔에서 다시 덤프해 보세요."
     )
 
 
@@ -1731,21 +1745,6 @@ def _title_key_error(info: CiaInfo, keys: Keys) -> str:
         "확인해 주세요. 중간에 손댄 파일이면 키가 맞아도 이렇게 나옵니다.",
     ]
     return "\n".join(lines)
-
-
-def _wrong_common_message(title_id: int, common_index: int | None) -> str:
-    where = (f"이 CIA의 티켓은 common 키 {common_index}번을 가리킵니다.\n\n"
-             if common_index is not None else "")
-    return (
-        "CIA 안의 타이틀 키는 풀렸는데, 내용이 NCCH로 나오지 않습니다.\n"
-        "keys.txt의 common 키가 이 파일과 맞지 않는 것 같습니다.\n\n"
-        f"{where}"
-        "keys.txt에 common0~common5만 있다면 그건 공통 키의 KeyY입니다.\n"
-        "그대로는 쓸 수 없고 slot0x3DKeyX와 짝을 맞춰 normal key를 만들어야 합니다.\n"
-        "두 줄이 다 들어 있는지 확인해 주세요.\n\n"
-        f"타이틀 0x{title_id:016X}의 원본 CIA가 맞는지, 콘솔에서 덤프한 그대로인지도\n"
-        "같이 봐야 합니다. 중간에 손댄 파일이면 키가 맞아도 이렇게 나옵니다."
-    )
 
 
 def _need_keyx_message(slots: list[int]) -> str:

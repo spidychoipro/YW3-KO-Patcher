@@ -35,7 +35,7 @@ import yw3convert as converter
 import yw3profile as profiles
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.4.4"
+APP_VERSION = "1.4.5"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
