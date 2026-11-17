@@ -35,9 +35,10 @@ import yw3convert as converter
 import yw3profile as profiles
 import yw3updates as updates
 import yw3verify as container_verify
+import yw3external as external
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.6.0"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -57,8 +58,12 @@ HASH_BLOCK = 8 * 1024 * 1024
 KEY_DUMP_URL = "https://citra-emu.com/wiki/aes-keys/"
 GODMODE9_URL = "https://3ds.hacks.guide/godmode9-usage.html"
 
-KEY_HELP_TEXT = """암호화된 본편 CIA를 풀려면 콘솔에서 뽑은 키 파일이 필요합니다.
-앱에는 키가 들어 있지 않고, 내려받지도 않습니다.
+KEY_HELP_TEXT = """암호화 CIA는 키 파일이 없으면 자동 복호화 도구로 먼저 처리합니다.
+처음에는 인터넷 연결이 필요하며 도구는 제작자 저장소에서 내려받아 검증합니다.
+복호화 후에도 원본/완성본 게임 영역과 내부 해시를 검증합니다.
+
+기존 키 파일을 사용하는 내장 처리도 지원합니다. 암호화 CCI의 내장 복호화에는
+키 파일이 필요합니다. 키를 직접 덤프하는 방법은 다음과 같습니다.
 
 1. 3DS에 GodMode9이 설치되어 있어야 합니다.
    커펌이 안 되어 있으면 3ds.hacks.guide 순서를 먼저 따라 하세요.
@@ -84,8 +89,7 @@ slot0x3DKeyX 줄을 같이 넣어 주세요.
 SD 카드를 빼기 싫으면 3DS에 ftpd를 설치하고 PC에서 FTP로 aes_keys.txt만
 받아도 됩니다. New 3DS는 무선 microSD 관리로도 접속됩니다.
 
-남의 콘솔에서 뽑은 파일은 이 콘솔의 CIA와 안 맞을 수 있습니다.
-본인 콘솔에서 뽑은 파일을 쓰세요.
+키 파일이나 키 값은 오류 제보에 첨부하지 않아도 됩니다.
 """
 
 
@@ -854,7 +858,20 @@ def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys,
             return prepared
         return _finish(role, prepared, keys, log, status)
 
+    def prepare_external() -> PreparedSource:
+        status(f"{role.label} CIA를 자동 복호화하는 중...")
+        result = external.prepare(path, role.key, work_dir, cache_dir(), download, log,
+                                  min_size=role.source_size if role.key == 'base' else 0)
+        padded = _packed_end(result) if role.key == 'base' else None
+        if padded is not None and padded >= result.stat().st_size:
+            padded = None
+        return finish(PreparedSource(result, True, allow_header=role.key == 'base',
+                                     padded_from=padded))
+
     try:
+        if (info.kind == "cia" and info.encrypted
+                and not (keys.has_common() or keys.keyx)):
+            return prepare_external()
         if role.key == "base":
             if info.kind == "cia":
                 status("본편 CIA를 CCI로 바꾸는 중...")
@@ -918,7 +935,13 @@ def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys,
                     path, work_dir / "update_decrypted.cia", keys, progress)
                 return finish(PreparedSource(result, True))
             return finish(PreparedSource(path, False))
-    except converter.ConvertError as exc:
+    except (converter.ConvertError, external.ExternalError) as exc:
+        if isinstance(exc, converter.ConvertError) and info.kind == 'cia' and info.encrypted:
+            log(f"[{role.label}] 내장 CIA 복호화에 실패해 자동 도구로 다시 시도합니다.")
+            try:
+                return prepare_external()
+            except external.ExternalError as fallback:
+                raise PatchError(str(fallback)) from fallback
         raise PatchError(str(exc)) from exc
     return PreparedSource(path, False)
 
@@ -1110,8 +1133,9 @@ class PatcherApp(tk.Tk):
         chosen = self.keys_var.get().strip().strip('"')
         if chosen and not Path(chosen).is_file():
             hints.append("· 고른 키 파일을 찾을 수 없어요. 경로를 확인해 주세요.")
-        if any(info.kind == "cia" and info.encrypted for info in infos) and not keys.has_common():
-            hints.append("· 암호화된 CIA를 풀려면 keys.txt의 common 키가 필요해요.")
+        if (any(info.kind == "cia" and info.encrypted for info in infos)
+                and not (keys.has_common() or keys.keyx)):
+            lines.append("· 암호화 CIA는 자동 복호화 후 패치합니다. 처음에는 인터넷 연결이 필요해요.")
         if keys.common_y and not (keys.keyx.get(converter.COMMON_KEYX_SLOT)
                                   or keys.keyx.get(converter.COMMON_KEYX_SLOT - 1)):
             hints.append("· keys.txt의 common0~common5는 KeyY예요. "
@@ -1243,7 +1267,10 @@ class PatcherApp(tk.Tk):
                 needed += BASE.source_size  # 복호화하거나 크기를 채운 CCI 임시 파일
         free = shutil.disk_usage(out_dir).free
         if free < needed:
-            self._log(f"저장 공간이 부족할 수 있습니다. 필요 약 {human_size(needed)}, 남은 공간 {human_size(free)}")
+            self._set_ready(
+                f"저장 공간이 부족합니다. 필요 약 {human_size(needed)}, 남은 공간 {human_size(free)}.\n"
+                "여유 공간을 확보하거나 다른 저장 위치를 골라 주세요.", "Warn.TLabel", True)
+            return
 
         keys = self._load_keys(base, update)
         self._last_out_dir = out_dir
@@ -1455,6 +1482,8 @@ def run_selftest(log_path: Path) -> int:
         if sha256_file(exe) != XDETTA_EXE_SHA256:
             ok = False
             log("xdelta3 지문 불일치")
+        external.ensure_tools(cache_dir(), download, log)
+        log("CIA 자동 복호화 도구 SHA-256 확인 통과")
         roles, label = resolve_patch_roles(log)
         log(label)
         for role in roles:
