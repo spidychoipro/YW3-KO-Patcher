@@ -833,6 +833,19 @@ def test_common_key_derivation(work: Path) -> None:
     assert converted.read_bytes() == reference.read_bytes(), "KeyY 경로 변환 결과가 다름"
     print("[ok] KeyY만 있는 keys.txt로 암호화 CIA 변환")
 
+    # GodMode9 DumpKeys가 실제로 쓰는 형식(=, 주석 줄)도 그대로 읽어야 한다.
+    dumpkeys = work / "aes_keys.txt"
+    dumpkeys.write_text(
+        "# Ticket Common KeyY (slot 0x3D)\n"
+        f"slot0x3DKeyX={key_x.hex()}\n"
+        f"common0={key_y.hex()}\n",
+        encoding="utf-8")
+    real_style = converter.load_keys_file(dumpkeys)
+    assert real_style.common_y[0] == key_y and real_style.keyx[0x3D] == key_x, real_style
+    again = converter.cia_to_cci(cia, work / "keyy_dump.cci", real_style, lambda m: None)
+    assert again.read_bytes() == reference.read_bytes(), "DumpKeys 형식 변환 결과가 다름"
+    print("[ok] GodMode9 aes_keys.txt 형식(=, 주석)도 읽음")
+
     wrong_dir = work / "wrong_keys"
     wrong_dir.mkdir()
     (wrong_dir / "keys.txt").write_text(
@@ -867,6 +880,38 @@ def test_common_key_derivation(work: Path) -> None:
     chosen = converter.load_keys([empty], [picked])
     assert chosen.has_common() and chosen.path == picked, chosen
     print("[ok] 화면에서 고른 키 파일을 폴더 없이 바로 읽음")
+
+
+def test_title_key_probe_any_content(work: Path) -> None:
+    """첫 내용이 깨져 있어도 다른 내용으로 타이틀 키를 확인하는지 본다."""
+    title_key = bytes.fromhex("00112233445566778899aabbccddeeff")
+    common_key = bytes.fromhex("ffeeddccbbaa99887766554433221100")
+    title_id = app.YW3_BASE_TITLE
+    contents = [make_fake_ncch(title_id, 0x4000), make_fake_ncch(title_id, 0x4000)]
+    cia = build_multi_cia(work / "probe_multi.cia", contents, title_id,
+                          title_key, common_key, True)
+    keys = converter.Keys(common=common_key)
+
+    stub = converter.read_cia(cia)
+    first = sorted(stub.contents, key=lambda item: item.index)[0]
+    broken = bytearray(cia.read_bytes())
+    broken[first.offset + 0x100] ^= 0xFF  # 암호문 한 블록을 건드려 NCCH 매직을 깨뜨림
+    cia.write_bytes(bytes(broken))
+
+    info = converter.read_cia(cia, keys)
+    assert info.title_key == title_key, "다른 내용으로 타이틀 키를 못 찾음"
+    assert info.key_verified, "타이틀 키 확인 실패로 기록됨"
+    assert first.index in info.bad_contents, info.bad_contents
+
+    try:
+        converter.cia_to_cci(cia, work / "probe_multi.cci", keys, lambda m: None)
+    except converter.ConvertError as exc:
+        message = str(exc)
+        assert "일부 내용이 NCCH로" in message, message
+        assert "common" not in message, message
+        print("[ok] 첫 내용이 깨져도 다른 내용으로 키 확인, 내용 문제로 안내")
+    else:
+        raise AssertionError("깨진 내용이 있는데 변환이 됐다")
 
 
 def test_convert_levels(work: Path) -> None:
@@ -1206,6 +1251,7 @@ def main() -> int:
         test_converter(work)
         test_key_files(work)
         test_common_key_derivation(work)
+        test_title_key_probe_any_content(work)
         test_ctr_stream(work)
         test_cci_decrypt(work)
         test_convert_levels(work)
