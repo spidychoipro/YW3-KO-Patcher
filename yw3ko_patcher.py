@@ -33,9 +33,10 @@ from tkinter import filedialog, messagebox, ttk
 
 import yw3convert as converter
 import yw3profile as profiles
+import yw3updates as updates
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.5.0"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -100,6 +101,9 @@ class Role:
     result_size: int
     result_sha256: str
     source_size: int = 0  # 공식 원본 크기(변환본이 모자랄 때 채워 넣는다)
+    source_profile: profiles.Profile | None = None
+    patch_version: str = ""
+    archive_path: Path | None = None
 
 
 BASE = Role(
@@ -124,6 +128,26 @@ UPDATE = Role(
     result_sha256="d6b7c9a298790fbadff65782c82d17a183b1574d107529d054aa46a309bdb747",
 )
 ROLES = (BASE, UPDATE)
+
+
+def resolve_patch_roles(log, progress=None) -> tuple[tuple[Role, ...], str]:
+    """공식 최신 배포의 패치/결과/원본 검증 정보를 한 벌로 고른다."""
+    try:
+        bundle, label = updates.resolve(cache_dir(), download, log, progress)
+    except updates.UpdateError as exc:
+        raise PatchError(str(exc)) from exc
+    if bundle is None:
+        log(label)
+        return ROLES, label
+    roles = tuple(Role(
+        key=spec.key, label="본편" if spec.key == "base" else "업데이트",
+        patch_name=spec.patch_name, patch_size=spec.patch_size,
+        patch_sha256=spec.patch_sha256, result_name=spec.result_name,
+        result_size=spec.result_size, result_sha256=spec.result_sha256,
+        source_size=spec.source_size, source_profile=spec.source_profile,
+        patch_version=bundle.version, archive_path=bundle.archive,
+    ) for spec in bundle.patches)
+    return roles, label
 
 YW3_BASE_TITLE = 0x00040000001AF400
 YW3_UPDATE_TITLE = 0x0004000E001AF400
@@ -378,14 +402,19 @@ def ensure_xdelta(log, progress=None) -> Path:
 def ensure_patch(role: Role, log, progress=None) -> Path:
     """역할별 xdelta 패치 파일을 준비한다. 캐시가 깨졌으면 다시 받는다."""
     target = cache_dir() / "patches" / role.patch_name
+    if role.archive_path is not None:
+        target = (cache_dir() / "patches" / role.patch_version
+                  / role.patch_sha256 / role.patch_name)
     if target.is_file() and target.stat().st_size == role.patch_size:
         if sha256_file(target) == role.patch_sha256:
             return target
         target.unlink(missing_ok=True)
 
-    archive = cache_dir() / PATCH_ZIP_NAME
+    archive = role.archive_path or (cache_dir() / PATCH_ZIP_NAME)
     for attempt in (1, 2):
         if not archive.is_file():
+            if role.archive_path is not None:
+                raise PatchError("선택한 패치 패키지가 없습니다. 다시 시작해 주세요.")
             log(f"한글 패치 v1.01 내려받는 중... ({human_size(PATCH_ZIP_SIZE)} 내외, 처음 한 번만)")
             download(PATCH_ZIP_URL, archive, progress)
             log("패치 압축 확인 중...")
@@ -406,6 +435,8 @@ def ensure_patch(role: Role, log, progress=None) -> Path:
             raise PatchError("패치 파일 지문이 공식 배포본과 다릅니다.")
         except (zipfile.BadZipFile, PatchError) as exc:
             archive.unlink(missing_ok=True)
+            if role.archive_path is not None:
+                raise PatchError(f"한글 패치 {role.patch_version}를 검증하지 못했습니다: {exc}") from exc
             if attempt == 2:
                 raise PatchError(f"{role.label} 패치를 준비하지 못했습니다.\n{exc}") from exc
     raise PatchError("패치 준비 실패")
@@ -636,7 +667,7 @@ def check_source_profile(path: Path, role: Role, keys: converter.Keys,
     돌려주는 목록이 비어 있으면 통과다. 문제가 있으면 어떤 영역이 왜 다른지
     사람이 읽을 수 있는 문장으로 돌려준다.
     """
-    profile = profiles.PROFILES.get(role.key)
+    profile = role.source_profile or profiles.PROFILES.get(role.key)
     if profile is None:
         return []
     try:
@@ -913,6 +944,9 @@ class PatcherApp(tk.Tk):
         self._add_file_row(files, 1, "② 업데이트 파일", self.update_var, self._pick_update)
         self._add_file_row(files, 2, "③ 저장 위치", self.out_var, self._pick_out, folder=True)
         self._add_file_row(files, 3, "키 파일 (선택)", self.keys_var, self._pick_keys)
+        self.patch_version_var = tk.StringVar(value="한글 패치: 시작 시 공식 최신 버전 확인")
+        ttk.Label(files, textvariable=self.patch_version_var, style="Hint.TLabel",
+                  wraplength=700).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.ready_label = ttk.Label(outer, textvariable=self.ready_var, style="Hint.TLabel",
                                      wraplength=760, justify="left")
         self.ready_label.grid(row=3, column=0, sticky="w", pady=(12, 0))
@@ -1180,7 +1214,8 @@ class PatcherApp(tk.Tk):
     def _worker(self, base: Path, update: Path, out_dir: Path, keys: converter.Keys) -> None:
         work_dir = out_dir / "_YW3_KO_work"
         try:
-            self._status("한글 패치 파일 준비 중...")
+            self._emit("patch_version", "한글 패치: 공식 최신 버전 확인 중...")
+            self._status("공식 최신 한글 패치 확인 중...")
             prep_value = 0.0
 
             def on_prep(done: int, total: int) -> None:
@@ -1189,13 +1224,15 @@ class PatcherApp(tk.Tk):
                     prep_value = max(prep_value, 9.0 * min(1.0, done / total))
                     self._progress(prep_value)
 
+            roles, version_label = resolve_patch_roles(self._log, on_prep)
+            self._emit("patch_version", version_label)
             exe = ensure_xdelta(self._log, on_prep)
-            patches = {role.key: ensure_patch(role, self._log, on_prep) for role in ROLES}
+            patches = {role.key: ensure_patch(role, self._log, on_prep) for role in roles}
             work_dir.mkdir(parents=True, exist_ok=True)
 
             plans = (
-                (BASE, base, 9.0, 28.0, 28.0, 60.0),
-                (UPDATE, update, 60.0, 70.0, 70.0, 96.0),
+                (roles[0], base, 9.0, 28.0, 28.0, 60.0),
+                (roles[1], update, 60.0, 70.0, 70.0, 96.0),
             )
             results: list[Path] = []
             notes: list[str] = []
@@ -1224,6 +1261,7 @@ class PatcherApp(tk.Tk):
             self._status("마무리 확인 중...")
             self._emit("done", True, results, out_dir, notes)
         except PatchError as exc:
+            self._emit("patch_version", "한글 패치 준비 실패 · 진행 기록을 확인해 주세요")
             self._log(f"오류: {exc}")
             self._emit("done", False, str(exc))
         except Exception as exc:  # noqa: BLE001 - UI로 넘길 마지막 안전망
@@ -1258,6 +1296,8 @@ class PatcherApp(tk.Tk):
                     self._append_log(event[1])
                 elif kind == "status":
                     self.status_var.set(event[1])
+                elif kind == "patch_version":
+                    self.patch_version_var.set(event[1])
                 elif kind == "progress" and event[1] is not None:
                     self.progress["value"] = max(0.0, min(100.0, event[1]))
                 elif kind == "done":
@@ -1361,7 +1401,9 @@ def run_selftest(log_path: Path) -> int:
         if sha256_file(exe) != XDETTA_EXE_SHA256:
             ok = False
             log("xdelta3 지문 불일치")
-        for role in ROLES:
+        roles, label = resolve_patch_roles(log)
+        log(label)
+        for role in roles:
             patch = ensure_patch(role, log)
             matched = sha256_file(patch) == role.patch_sha256
             ok = ok and matched

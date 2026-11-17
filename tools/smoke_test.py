@@ -174,10 +174,11 @@ def test_gui_flow(exe: Path, work: Path) -> None:
         outputs[key] = (data, patch)
 
     original = (app.BASE, app.UPDATE, app.ROLES, app.ensure_xdelta, app.ensure_patch,
-                app.messagebox.askyesno)
+                app.messagebox.askyesno, app.resolve_patch_roles)
     app.BASE, app.UPDATE, app.ROLES = roles[0], roles[1], tuple(roles)
     app.ensure_xdelta = lambda log, progress=None: exe
     app.ensure_patch = lambda role, log, progress=None: outputs[role.key][1]
+    app.resolve_patch_roles = lambda log, progress=None: (tuple(roles), "테스트 한글 패치")
     app.messagebox.askyesno = lambda *args, **kwargs: True
     out_dir = work / "gui_out"
     out_dir.mkdir()
@@ -200,6 +201,7 @@ def test_gui_flow(exe: Path, work: Path) -> None:
             assert result.is_file(), f"{result} 없음"
             assert result.read_bytes() == outputs[role.key][0], f"{role.key} 내용 불일치"
         assert gui.progress["value"] == 100, gui.progress["value"]
+        assert gui.patch_version_var.get() == "테스트 한글 패치", gui.patch_version_var.get()
         assert "완료" in gui.ready_var.get(), gui.ready_var.get()
         assert gui.open_button.winfo_manager() == "pack", "완료 후 폴더 열기 버튼이 없음"
         print(f"[ok] GUI 흐름 완료 (진행률 {gui.progress['value']:.0f}%)")
@@ -207,7 +209,7 @@ def test_gui_flow(exe: Path, work: Path) -> None:
         if gui is not None:
             gui.destroy()
         (app.BASE, app.UPDATE, app.ROLES, app.ensure_xdelta, app.ensure_patch,
-         app.messagebox.askyesno) = original
+         app.messagebox.askyesno, app.resolve_patch_roles) = original
 
 
 def write_fake_ncch(buffer: bytearray, offset: int, title_id: int, encrypted: bool) -> None:
