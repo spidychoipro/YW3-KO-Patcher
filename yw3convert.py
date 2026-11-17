@@ -613,7 +613,7 @@ def ncch_crypto_info(header: bytes) -> NcchCryptoInfo:
     else:
         content_slot = 0x25
     return NcchCryptoInfo(
-        program_id=int.from_bytes(header[0x118:0x120], "big"),
+        program_id=int.from_bytes(header[0x118:0x120], "little"),
         version=int.from_bytes(header[0x112:0x114], "little"),
         flags3=flags3,
         flags7=flags7,
@@ -740,7 +740,7 @@ def _seed_hash(seed: bytes, program_id: int) -> bytes:
 
 def _pick_seed(header: bytes, keys: Keys) -> bytes | None:
     """이 NCCH에 맞는 시드를 찾는다. 헤더의 hash_seed로 검증한다."""
-    program_id = int.from_bytes(header[0x118:0x120], "big")
+    program_id = int.from_bytes(header[0x118:0x120], "little")
     seed = keys.seeds.get(program_id)
     wanted = header[0x114:0x118]
     if seed is not None and (not any(wanted) or _seed_hash(seed, program_id) == wanted):
@@ -1276,8 +1276,6 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
         ticket_size = int.from_bytes(head[0x0C:0x10], "little")
         tmd_size = int.from_bytes(head[0x10:0x14], "little")
 
-        meta_size = int.from_bytes(head[0x14:0x18], "little")
-
         def probe(offset: int) -> int:
             handle.seek(offset)
             found = handle.read(4)
@@ -1293,7 +1291,8 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
         cert_offset = place(header_size)
         ticket_offset = place(cert_offset + cert_size)
         tmd_offset = place(ticket_offset + ticket_size)
-        meta_offset = _align(tmd_offset + tmd_size, 0x40)
+        # CIA content follows the TMD; optional metadata follows content.
+        content_area = _align(tmd_offset + tmd_size, 0x40)
         handle.seek(ticket_offset)
         ticket = handle.read(ticket_size)
         handle.seek(tmd_offset)
@@ -1311,7 +1310,6 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
     content_count = int.from_bytes(tmd_header[0x9E:0xA0], "big")
 
     records = tmd[tmd_sig + 0xC4 + 0x24 * 64:]
-    content_area = _align(meta_offset + meta_size, 0x40)
     contents: list[CiaContent] = []
     offset = content_area
     for index in range(content_count):
@@ -1512,7 +1510,7 @@ def _build_ncsd_header(parts: list[tuple[bytes, int]], total_size: int | None = 
     header[0x300:0x304] = total.to_bytes(4, "little")  # 카트리지 채운 크기
     header[0x310:0x312] = first[0x112:0x114]  # 타이틀 버전
 
-    title_id = int.from_bytes(first[0x118:0x120], "big")
+    title_id = int.from_bytes(first[0x118:0x120], "little")
     header[0x1000:0x1008] = title_id.to_bytes(8, "little")  # 시드 자리
     header[0x1100:0x1200] = first[0x100:0x200]  # NCCH 헤더 사본(서명 제외)
     return bytes(header)

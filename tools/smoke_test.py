@@ -213,7 +213,7 @@ def test_gui_flow(exe: Path, work: Path) -> None:
 def write_fake_ncch(buffer: bytearray, offset: int, title_id: int, encrypted: bool) -> None:
     buffer[offset + 0x100:offset + 0x104] = b"NCCH"
     buffer[offset + 0x18F] = 0x00 if encrypted else 0x04
-    buffer[offset + 0x118:offset + 0x120] = title_id.to_bytes(8, "big")
+    buffer[offset + 0x118:offset + 0x120] = title_id.to_bytes(8, "little")
 
 
 def make_fake_cci(work: Path, name: str, title_id: int, encrypted: bool) -> Path:
@@ -227,7 +227,8 @@ def make_fake_cci(work: Path, name: str, title_id: int, encrypted: bool) -> Path
 
 
 def _cia_layout(header_size: int, cert_size: int, ticket_size: int, tmd_size: int,
-                meta_size: int = 0, aligned: bool = True) -> tuple[int, int, int, int, int]:
+                meta_size: int = 0, aligned: bool = True,
+                content_size: int = 0) -> tuple[int, int, int, int, int]:
     """CIA 각 구간 위치. 실제 CIA는 0x40 경계에 맞춰 놓는다."""
     def step(offset: int) -> int:
         return _align(offset, 0x40) if aligned else offset
@@ -235,16 +236,16 @@ def _cia_layout(header_size: int, cert_size: int, ticket_size: int, tmd_size: in
     cert_offset = step(header_size)
     ticket_offset = step(cert_offset + cert_size)
     tmd_offset = step(ticket_offset + ticket_size)
-    meta_offset = step(tmd_offset + tmd_size)
-    content_offset = _align(meta_offset + meta_size, 0x40)
+    content_offset = _align(tmd_offset + tmd_size, 0x40)
+    meta_offset = _align(content_offset + content_size, 0x40) if meta_size else 0
     return cert_offset, ticket_offset, tmd_offset, meta_offset, content_offset
 
 
 def make_fake_cia(work: Path, name: str, title_id: int, encrypted: bool) -> Path:
     header_size, cert_size, ticket_size, tmd_size, meta_size = 0x2020, 0xA00, 0x350, 0xB34, 0x3AC0
     cert_offset, ticket_offset, tmd_offset, _meta_offset, content = _cia_layout(
-        header_size, cert_size, ticket_size, tmd_size, meta_size)
-    data = bytearray(content + 0x400)
+        header_size, cert_size, ticket_size, tmd_size, meta_size, content_size=0x400)
+    data = bytearray(content + 0x400 + meta_size)
     struct.pack_into("<I", data, 0x00, header_size)
     struct.pack_into("<I", data, 0x08, cert_size)
     struct.pack_into("<I", data, 0x0C, ticket_size)
@@ -351,7 +352,7 @@ def make_fake_ncch(title_id: int, size: int = 0x4000) -> bytes:
     data[0x104:0x108] = (size // 0x200).to_bytes(4, "little")
     data[0x108:0x110] = title_id.to_bytes(8, "big")
     data[0x112:0x114] = (4).to_bytes(2, "big")
-    data[0x118:0x120] = title_id.to_bytes(8, "big")
+    data[0x118:0x120] = title_id.to_bytes(8, "little")
     data[0x160:0x180] = bytes(range(32))
     data[0x18F] = 0x00
     for index in range(0x400, size, 0x100):
@@ -534,7 +535,7 @@ def make_crypto_ncch(title_id: int, seed: bytes | None, version: int = 0,
     header[0x112:0x114] = version.to_bytes(2, "little")
     if seed is not None:
         header[0x114:0x118] = converter._seed_hash(seed, title_id)
-    header[0x118:0x120] = title_id.to_bytes(8, "big")
+    header[0x118:0x120] = title_id.to_bytes(8, "little")
 
     exthdr = bytearray(0x800)
     for index in range(len(exthdr)):
@@ -576,7 +577,7 @@ def make_crypto_ncch(title_id: int, seed: bytes | None, version: int = 0,
 def build_crypto_cci(work: Path, name: str, plain: bytes, version: int,
                      flags3: int, seed: bytes | None) -> tuple[Path, bytes, converter.Keys]:
     """평문 NCCH를 표준 암호로 다시 암호화한 CCI를 만든다."""
-    title_id = int.from_bytes(plain[0x118:0x120], "big")
+    title_id = int.from_bytes(plain[0x118:0x120], "little")
     keyx = {
         0x2C: bytes.fromhex("00112233445566778899aabbccddeeff"),
         0x18: bytes.fromhex("ffeeddccbbaa99887766554433221100"),

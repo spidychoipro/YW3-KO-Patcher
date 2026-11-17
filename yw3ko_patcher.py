@@ -149,7 +149,7 @@ def _ncch_header(data: bytes, offset: int) -> tuple[bool, int, bool, bytes] | No
         return None
     header = data[offset:offset + 0x200]
     flags7 = header[0x18F]
-    title_id = int.from_bytes(header[0x118: 0x120], "big")
+    title_id = int.from_bytes(header[0x118: 0x120], "little")
     return (not (flags7 & 0x04), title_id, bool(flags7 & 0x20), header)
 
 
@@ -174,8 +174,7 @@ def inspect_rom(path: Path) -> RomInfo:
         cert_offset = (header_size + 0x3F) & ~0x3F
         ticket_offset = (cert_offset + int.from_bytes(head[0x08:0x0C], "little") + 0x3F) & ~0x3F
         tmd_offset = (ticket_offset + int.from_bytes(head[0x0C:0x10], "little") + 0x3F) & ~0x3F
-        meta_offset = (tmd_offset + int.from_bytes(head[0x10:0x14], "little") + 0x3F) & ~0x3F
-        offset = (meta_offset + int.from_bytes(head[0x14:0x18], "little") + 0x3F) & ~0x3F
+        offset = (tmd_offset + int.from_bytes(head[0x10:0x14], "little") + 0x3F) & ~0x3F
         found = _ncch_header(head, offset)
         for delta in range(0x40, 0x400, 0x40):  # 정렬이 다를 때를 위한 여유 탐색
             if found:
@@ -664,7 +663,7 @@ def check_source_profile(path: Path, role: Role, keys: converter.Keys,
                 continue
 
             header = actual.header
-            program_id = int.from_bytes(header[0x118:0x120], "big")
+            program_id = int.from_bytes(header[0x118:0x120], "little")
             product = header[0x150:0x160].rstrip(b"\x00").decode("ascii", "replace")
             soft: list[str] = []
             if program_id != expected.program_id:
