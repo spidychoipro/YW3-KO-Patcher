@@ -34,6 +34,8 @@ class PatchSpec:
     result_sha256: str
     source_size: int
     source_profile: profiles.Profile
+    source_sha256: str
+    target_profile: profiles.Profile
 
 
 @dataclass(frozen=True)
@@ -121,7 +123,8 @@ def read_manifest(archive: Path, version: str) -> Bundle:
                 specs.append(PatchSpec(key, name, size, _hash(patch["patch_sha256"]),
                     _filename(patch["target_file"], ".cci" if key == "base" else ".cia"),
                     _size(patch["target_size"]), _hash(patch["target_sha256"]),
-                    _size(patch["source_size"]), _profile(patch["source_profile"], key)))
+                    _size(patch["source_size"]), _profile(patch["source_profile"], key),
+                    _hash(patch["source_sha256"]), _profile(patch["target_profile"], key)))
             if {s.key for s in specs} != {"base", "update"}:
                 raise ValueError("본편/업데이트 패치 정보가 모두 필요합니다")
         return Bundle(version, archive, tuple(sorted(specs, key=lambda s: s.key)))

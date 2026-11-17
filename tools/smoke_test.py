@@ -1169,8 +1169,8 @@ def test_profile_check(work: Path) -> None:
                 role, bad_path, work, converter.Keys(),
                 lambda m: None, lambda s: None, lambda p: None)
         except app.PatchError as exc:
-            assert "ExeFS" in str(exc) and "0xC3000" in str(exc), str(exc)
-            print("[ok] ExeFS가 다르면 0xC3000 안내와 함께 중단")
+            assert "ExeFS" in str(exc) and "원본 해시" in str(exc), str(exc)
+            print("[ok] ExeFS가 다르면 원본 영역 해시 불일치로 중단")
         else:
             raise AssertionError("영역이 다른데 prepare_source가 통과됨")
     finally:

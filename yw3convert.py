@@ -1165,6 +1165,7 @@ class CiaInfo:
     title_key_origin: str = ""
     key_candidates: int = 0
     bad_contents: tuple[int, ...] = ()
+    tmd_offset: int = 0
 
     @property
     def program(self) -> CiaContent | None:
@@ -1385,6 +1386,7 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
         title_key_origin=title_key_origin,
         key_candidates=key_candidates,
         bad_contents=tuple(bad_contents),
+        tmd_offset=tmd_offset,
     )
 
 

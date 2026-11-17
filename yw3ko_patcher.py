@@ -27,16 +27,17 @@ import urllib.request
 import webbrowser
 import zipfile
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import yw3convert as converter
 import yw3profile as profiles
 import yw3updates as updates
+import yw3verify as container_verify
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -104,6 +105,8 @@ class Role:
     source_profile: profiles.Profile | None = None
     patch_version: str = ""
     archive_path: Path | None = None
+    source_sha256: str = ""
+    target_profile: profiles.Profile | None = None
 
 
 BASE = Role(
@@ -116,6 +119,8 @@ BASE = Role(
     result_size=3278712832,
     result_sha256="905b326fd6949054ac64dc5db9bbb6ef90510c5da824fc197dc8a8a69f0cdb34",
     source_size=3270860800,
+    source_sha256=profiles.SOURCE_SHA256["base"],
+    target_profile=profiles.TARGET_PROFILES["base"],
 )
 UPDATE = Role(
     key="update",
@@ -126,6 +131,8 @@ UPDATE = Role(
     result_name="YW3_Sukiyaki_KO_update4.cia",
     result_size=196305920,
     result_sha256="d6b7c9a298790fbadff65782c82d17a183b1574d107529d054aa46a309bdb747",
+    source_sha256=profiles.SOURCE_SHA256["update"],
+    target_profile=profiles.TARGET_PROFILES["update"],
 )
 ROLES = (BASE, UPDATE)
 
@@ -146,6 +153,7 @@ def resolve_patch_roles(log, progress=None) -> tuple[tuple[Role, ...], str]:
         result_size=spec.result_size, result_sha256=spec.result_sha256,
         source_size=spec.source_size, source_profile=spec.source_profile,
         patch_version=bundle.version, archive_path=bundle.archive,
+        source_sha256=spec.source_sha256, target_profile=spec.target_profile,
     ) for spec in bundle.patches)
     return roles, label
 
@@ -470,15 +478,14 @@ def _explain_mismatch(role: Role, bad: list[tuple[int, int]]) -> str:
         "요괴워치3 스키야키 일본판 v0이 맞는지 확인해 주세요. "
         "본편 자리에 업데이트를 넣었거나, 다른 지역·버전 파일이면 이렇게 됩니다. "
         "이미 한글 패치한 파일을 원본으로 넣어도 이렇게 나옵니다.\n"
-        "0xC3000처럼 8MB 안쪽에서 막히면 ExeFS(실행 코드)가 원본과 다른 경우가 많아요. "
-        "다른 도구로 CCI를 만들었다면 변환 전 원본(CIA)을 그대로 넣어 보세요."
+        "표시된 오프셋은 패치 창의 시작 위치입니다. 그 위치만으로 ExeFS 손상을 판단할 수 없습니다."
     )
 
 
 def apply_patch(role: Role, source: Path, out_dir: Path, exe: Path, patch: Path, overwrite: bool,
                 verify: bool, log, progress, status, strict: bool | None = None,
                 report: dict | None = None, allow_header: bool = False,
-                padded_from: int | None = None) -> Path:
+                padded_from: int | None = None, source_verified: bool = False) -> Path:
     """xdelta3로 패치 하나를 적용하고 결과 경로를 돌려준다.
 
     strict=False면 변환본으로 패치한 것으로 보고 검사를 조금 풀어준다.
@@ -488,6 +495,13 @@ def apply_patch(role: Role, source: Path, out_dir: Path, exe: Path, patch: Path,
     if strict is None:
         strict = verify
     tolerant = not strict
+    payload_mode = tolerant and role.target_profile is not None
+    if payload_mode and not verify:
+        raise PatchError("호환 적용은 결과 게임 영역 검증을 끌 수 없습니다.")
+    if payload_mode and not source_verified:
+        issues = check_source_profile(source, role, converter.Keys(), log, status, padded_from)
+        if issues:
+            raise PatchError(_profile_error(role, issues))
     final = out_dir / role.result_name
     if final.exists() and not overwrite:
         raise PatchError(f"결과 파일이 이미 있습니다: {final}")
@@ -527,8 +541,24 @@ def apply_patch(role: Role, source: Path, out_dir: Path, exe: Path, patch: Path,
 
         if verify:
             status("결과 확인 중...")
-            windows = converter.read_vcdiff_windows(patch) if tolerant else []
-            if windows:
+            windows = converter.read_vcdiff_windows(patch) if tolerant and not payload_mode else []
+            if payload_mode:
+                if part.stat().st_size != role.result_size:
+                    raise PatchError(f"{role.label} 결과 파일 크기가 공식 값과 다릅니다.")
+                issues = check_source_profile(part, role, converter.Keys(), log, status, target=True)
+                if issues:
+                    raise PatchError(f"{role.label} 결과 게임 영역이 공식 완성본과 다릅니다.\n" + '\n'.join(issues))
+                try:
+                    container_verify.check_ncch_links(part, _actual_parts(part, converter.Keys()))
+                    container_verify.update_cia_tmd(part, repair=True)
+                    container_verify.update_cia_tmd(part, repair=False)
+                except converter.ConvertError as exc:
+                    raise PatchError(str(exc)) from exc
+                got = sha256_file(part)
+                if report is not None:
+                    report["payload_verified"] = True
+                log(f"[{role.label}] 완성본 게임 영역·NCCH 및 컨테이너 해시 검증 통과")
+            elif windows:
                 log(f"[{role.label}] 패치 창 {len(windows)}개로 결과를 확인합니다")
                 if part.stat().st_size != role.result_size:
                     raise PatchError(
@@ -575,7 +605,8 @@ def apply_patch(role: Role, source: Path, out_dir: Path, exe: Path, patch: Path,
                 if report is not None:
                     report["verified"] = False
                 log(f"[{role.label}] 지문이 공식 값과 달라요: {got}")
-                log(f"[{role.label}] 변환본으로 패치해서 헤더만 달라진 경우예요. 파일은 저장합니다.")
+                log(f"[{role.label}] 게임 영역 검증을 통과한 호환 결과를 저장합니다." if payload_mode
+                    else f"[{role.label}] 변환본의 창 단위 검사를 통과했습니다.")
         progress(100)
         os.replace(part, final)
     except Exception:
@@ -594,6 +625,8 @@ class PreparedSource:
     converted: bool
     allow_header: bool = False
     padded_from: int | None = None
+    compatibility: bool = False
+    profile_verified: bool = False
 
 
 def _packed_end(path: Path) -> int:
@@ -661,14 +694,17 @@ def _hash_at(handle, offset: int, size: int) -> str:
 
 
 def check_source_profile(path: Path, role: Role, keys: converter.Keys,
-                         log, status, padded_from: int | None = None) -> list[str]:
+                         log, status, padded_from: int | None = None,
+                         target: bool = False) -> list[str]:
     """원본의 게임 영역 해시를 공식 manifest와 비교한다.
 
     돌려주는 목록이 비어 있으면 통과다. 문제가 있으면 어떤 영역이 왜 다른지
     사람이 읽을 수 있는 문장으로 돌려준다.
     """
-    profile = role.source_profile or profiles.PROFILES.get(role.key)
+    profile = role.target_profile if target else (role.source_profile or profiles.PROFILES.get(role.key))
     if profile is None:
+        if role.target_profile is not None:
+            return ["호환 적용에 필요한 원본 프로필이 없습니다"]
         return []
     try:
         actual_parts = _actual_parts(path, keys)
@@ -677,7 +713,9 @@ def check_source_profile(path: Path, role: Role, keys: converter.Keys,
 
     by_index = {part.index: part for part in actual_parts}
     issues: list[str] = []
-    status(f"{role.label} 원본이 공식 배포본과 같은지 확인하는 중...")
+    if target and set(by_index) - {p.index for p in profile.parts}:
+        issues.append("공식 결과에 없는 파티션이 있습니다")
+    status(f"{role.label} {'결과' if target else '원본'} 게임 영역을 공식 배포본과 대조하는 중...")
     log(f"[{role.label}] 게임 영역 해시를 공식 manifest와 대조합니다")
 
     with path.open("rb") as handle:
@@ -685,7 +723,7 @@ def check_source_profile(path: Path, role: Role, keys: converter.Keys,
             main_part = expected.index == 0
             actual = by_index.get(expected.index)
             if actual is None:
-                if not main_part or padded_from is not None:
+                if not main_part:
                     why = ("뒤쪽이 잘린 원본" if padded_from is not None
                            else "설명서/추가 파티션")
                     log(f"[{role.label}] 파티션 {expected.index}는 없음({why}), 건너뜁니다")
@@ -707,6 +745,8 @@ def check_source_profile(path: Path, role: Role, keys: converter.Keys,
                     f"({product}, 공식 {expected.product_code})")
 
             regions = {region.name: region for region in converter.ncch_regions(header)}
+            if target and set(regions) != {r.name for r in expected.regions}:
+                soft.append(f"파티션 {expected.index}의 결과 영역 구성이 다릅니다")
             for wanted in expected.regions:
                 name = _REGION_NAMES.get(wanted.name, wanted.name)
                 found = regions.get(wanted.name)
@@ -719,10 +759,13 @@ def check_source_profile(path: Path, role: Role, keys: converter.Keys,
                         f"({human_size(found.size)}, 공식 {human_size(wanted.size)})")
                     continue
                 absolute = actual.offset + found.offset
-                if absolute + found.size > path.stat().st_size:
-                    log(f"[{role.label}] {name}는 파일 끝을 넘어서 건너뜁니다")
+                if (found.offset < 0x200 or found.offset + found.size > actual.size
+                        or absolute + found.size > path.stat().st_size):
+                    soft.append(f"{name} 영역이 파일/파티션 범위를 넘습니다")
                     continue
                 if padded_from is not None and absolute + found.size > padded_from:
+                    if main_part:
+                        soft.append(f"{name} 게임 영역이 잘렸습니다")
                     log(f"[{role.label}] {name}는 잘린 뒤쪽 구간이라 건너뜁니다")
                     continue
                 if issues and wanted.name == "romfs":
@@ -734,7 +777,7 @@ def check_source_profile(path: Path, role: Role, keys: converter.Keys,
                 if digest != wanted.sha256:
                     soft.append(f"{name} 내용이 공식 원본과 다릅니다")
 
-            if main_part:
+            if main_part or target:
                 issues.extend(soft)
             else:
                 # 설명서/DLP 같은 곁다리 파티션은 본편 패치와 상관없다.
@@ -758,7 +801,7 @@ def _profile_error(role: Role, issues: list[str]) -> str:
     ]
     if any("ExeFS" in issue for issue in issues):
         lines.append(
-            "ExeFS가 다르면 0xC3000 같은 안쪽 오프셋에서 막히는 것처럼 보입니다. "
+            "ExeFS 내용이 제작팀의 원본 해시와 일치하지 않습니다. "
             "다른 버전이거나, 변환 도구가 ExeFS를 제대로 복호화하지 못한 파일일 수 있어요.")
     lines += [
         "",
@@ -787,11 +830,18 @@ def _pad_to_size(path: Path, target_size: int, dst: Path, log) -> Path:
 def _finish(role: Role, prepared: PreparedSource, keys: converter.Keys,
             log, status) -> PreparedSource:
     """준비한 원본이 공식 배포본과 같은 데이터인지 확인하고 넘긴다."""
+    exact = bool(role.source_sha256) and sha256_file(prepared.path) == role.source_sha256
+    if exact:
+        log(f"[{role.label}] 원본 전체 SHA-256 일치")
+        return replace(prepared, profile_verified=True)
     issues = check_source_profile(
         prepared.path, role, keys, log, status, prepared.padded_from)
     if issues:
         raise PatchError(_profile_error(role, issues))
-    return prepared
+    compatible = role.target_profile is not None
+    if compatible:
+        log(f"[{role.label}] 게임 영역이 동일한 호환 원본입니다. 결과 게임 영역도 검증합니다.")
+    return replace(prepared, compatibility=compatible, profile_verified=True)
 
 
 def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys, log, status,
@@ -1247,14 +1297,17 @@ class PatcherApp(tk.Tk):
                     self._log,
                     lambda percent, a=low, b=high: self._progress(a + (b - a) * percent / 100.0),
                     self._status,
-                    strict=not prepared.converted,
+                    strict=not (prepared.converted or prepared.compatibility),
+                    source_verified=prepared.profile_verified,
                     report=report,
                     allow_header=prepared.allow_header,
                     padded_from=prepared.padded_from,
                 ))
                 if prepared.converted:
                     prepared.path.unlink(missing_ok=True)
-                if report.get("verified") is False:
+                if report.get("payload_verified"):
+                    notes.append(f"{role.label}: 공식 완성본의 게임 영역과 내부 해시를 확인했습니다.")
+                elif report.get("verified") is False:
                     notes.append(
                         f"{role.label}: 원본이 공식 CCI가 아니라 헤더가 조금 달라요. "
                         "게임 내용은 확인했으니 그대로 쓰면 됩니다.")

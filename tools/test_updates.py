@@ -1,5 +1,6 @@
 """Offline release selection, validation, cache and worker regressions."""
 import hashlib
+import copy
 from dataclasses import replace
 import json
 import os
@@ -21,7 +22,7 @@ def manifest(version):
     for key, title, ext in (("base", "00040000001af400", "cci"),
                             ("update", "0004000e001af400", "cia")):
         payload = (version + key).encode()
-        patches.append(dict(role=key, source_size=8192,
+        patches.append(dict(role=key, source_size=8192, source_sha256='2' * 64,
             patch_file=f'{key}.xdelta', patch_size=len(payload),
             patch_sha256=hashlib.sha256(payload).hexdigest(),
             target_file=f'{key}.{ext}', target_size=4096,
@@ -29,6 +30,7 @@ def manifest(version):
             source_profile=dict(role=key, parts=[dict(index=0, program_id=title,
                 product_code='', regions=[dict(name=n, size=512, sha256='1' * 64)
                                            for n in ('exefs', 'romfs')])])))
+        patches[-1]['target_profile'] = copy.deepcopy(patches[-1]['source_profile'])
     return dict(package_version=version, format=updates.FORMAT,
                 xdelta_version='3.2.2', xdelta_sha256=updates.XDELTA_SHA256,
                 patches=patches)
@@ -75,6 +77,8 @@ class UpdatesTests(unittest.TestCase):
         self.assertEqual(roles[0].result_sha256, data['patches'][0]['target_sha256'])
         self.assertEqual(roles[0].source_profile.parts[0].program_id, app.YW3_BASE_TITLE)
         self.assertEqual(roles[0].patch_version, 'v1.02')
+        self.assertEqual(roles[0].source_sha256, data['patches'][0]['source_sha256'])
+        self.assertEqual(roles[0].target_profile.parts[0].program_id, app.YW3_BASE_TITLE)
         for role in roles:
             self.assertEqual(app.ensure_patch(role, self.log).read_bytes(),
                              ('v1.02' + role.key).encode())
@@ -149,7 +153,9 @@ class UpdatesTests(unittest.TestCase):
                    lambda d: d['patches'][0].update(patch_file='../evil.xdelta'),
                    lambda d: d['patches'][0].update(target_sha256='bad'),
                    lambda d: d['patches'][0]['source_profile'].update(parts=[]),
-                   lambda d: d.update(package_version='v1.01')]
+                   lambda d: d.update(package_version='v1.01'),
+                   lambda d: d['patches'][0].update(source_sha256='bad'),
+                   lambda d: d['patches'][0].pop('target_profile')]
         for change in changes:
             with self.subTest(change=change):
                 _, download = self.release(modify=change)
