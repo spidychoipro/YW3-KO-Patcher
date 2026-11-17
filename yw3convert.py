@@ -355,6 +355,28 @@ class Keys:
     def has_common(self) -> bool:
         return bool(self.common or self.common_keys or self.common_y)
 
+    def summary(self) -> list[str]:
+        """키 파일에 뭐가 들어 있는지 사람이 읽을 수 있게 정리한다."""
+        if self.path is None and not (self.common or self.common_keys
+                                      or self.common_y or self.keyx or self.seeds):
+            return ["키 파일: 없음 (암호화된 파일이면 필요해요)"]
+        lines = [f"키 파일: {self.path}" if self.path else "키 파일: (경로 없음)"]
+        common: list[str] = []
+        if self.common:
+            common.append("기본 common")
+        if self.common_keys:
+            common.append("normal " + ", ".join(
+                f"{index}" for index in sorted(self.common_keys)))
+        if self.common_y:
+            common.append("KeyY " + ", ".join(
+                f"{index}" for index in sorted(self.common_y)))
+        lines.append("  공통 키: " + (", ".join(common) if common else "없음"))
+        keyx = ", ".join(f"0x{slot:02X}" for slot in sorted(self.keyx))
+        lines.append("  keyX 슬롯: " + (keyx if keyx else "없음"))
+        if self.seeds:
+            lines.append(f"  시드: {len(self.seeds)}개")
+        return lines
+
 
 def _parse_keyx_slot(name: str) -> int | None:
     """'slot0x2CKeyX', 'keyX2C', '2c' 같은 이름에서 keyX 슬롯 번호를 뽑는다."""
@@ -611,6 +633,44 @@ class NcchPartition:
     header: bytes
 
 
+@dataclass(frozen=True)
+class NcchRegion:
+    """NCCH 안의 게임 영역 하나. offset/size는 NCCH 시작부터의 바이트."""
+
+    name: str
+    offset: int
+    size: int
+
+
+def ncch_unit(header: bytes) -> int:
+    """NCCH 미디어 유닛 크기. 보통 0x200이고, 큰 게임은 더 클 수 있다."""
+    return MEDIA_UNIT << header[0x18E]
+
+
+def ncch_regions(header: bytes) -> list[NcchRegion]:
+    """NCCH 헤더가 가리키는 확장 헤더/평문/로고/ExeFS/RomFS 영역을 읽는다.
+
+    공식 패치의 manifest.json과 같은 방식으로 위치를 계산한다.
+    크기가 0인 영역은 목록에서 뺀다.
+    """
+    unit = ncch_unit(header)
+
+    def u32(at: int) -> int:
+        return int.from_bytes(header[at:at + 4], "little")
+
+    regions: list[NcchRegion] = []
+    exthdr_size = u32(0x180)
+    if exthdr_size:
+        regions.append(NcchRegion("exheader", 0x200, exthdr_size))
+    for name, field in (("plain", 0x190), ("logo", 0x198),
+                        ("exefs", 0x1A0), ("romfs", 0x1B0)):
+        offset = u32(field) * unit
+        size = u32(field + 4) * unit
+        if size:
+            regions.append(NcchRegion(name, offset, size))
+    return regions
+
+
 @dataclass
 class _DecryptRange:
     """복호화할 구간. offset은 기준(NCCH 또는 파일) 시작부터의 바이트."""
@@ -708,56 +768,207 @@ def _read_decrypt(handle, partition: NcchPartition, part_range: _DecryptRange) -
     return ctr_decrypt(part_range.key, part_range.ctr_base, part_range.ctr_offset, data)
 
 
-def _plan_partition(handle, partition: NcchPartition, keys: Keys) -> _PartitionPlan | None:
-    """한 파티션의 복호화 구간을 만들고 키가 맞는지 검증한다."""
+def _read_plain(handle, partition: NcchPartition, offset: int, size: int) -> bytes:
+    handle.seek(partition.offset + offset)
+    return handle.read(size)
+
+
+def _exefs_names_ok(header: bytes) -> bool | None:
+    """복호화된 ExeFS 첫 블록이 그럴듯한지 본다. 해시가 없을 때 쓰는 보조 확인."""
+    if len(header) < 0x10:
+        return None
+    known = {b".code", b"code", b"banner", b"icon", b"logo", b".fst", b"fst"}
+    names = [header[index * 0x10:index * 0x10 + 8].rstrip(b"\x00")
+             for index in range(10)]
+    found = sum(1 for name in names if name in known)
+    if found:
+        return True
+    return False
+
+
+def _probe_regions(handle, partition: NcchPartition,
+                   key_menu: bytes | None, key_content: bytes | None
+                   ) -> tuple[bool | None, list[str]]:
+    """확장 헤더/ExeFS/RomFS를 풀어(또는 그대로 읽어) 실제 내용인지 확인한다.
+
+    key_menu/key_content가 None이면 이미 복호화된 파일로 보고 그대로 읽는다.
+    확인할 수 있는 영역이 없으면 None을 돌려준다.
+    """
     header = partition.header
     info = ncch_crypto_info(header)
-    if info.flags7 & 0x04:
-        return None  # 이미 복호화됨
+    checks: list[bool] = []
+    issues: list[str] = []
+    exthdr_size = int.from_bytes(header[0x180:0x184], "little")
+    exefs_offset = int.from_bytes(header[0x1A0:0x1A4], "little") * ncch_unit(header)
+    exefs_size = int.from_bytes(header[0x1A4:0x1A8], "little") * ncch_unit(header)
+    romfs_offset = int.from_bytes(header[0x1B0:0x1B4], "little") * ncch_unit(header)
+    romfs_size = int.from_bytes(header[0x1B4:0x1B8], "little") * ncch_unit(header)
 
+    def read(offset: int, size: int, key: bytes | None, section: int,
+             ctr_offset: int = 0) -> bytes:
+        data = _read_plain(handle, partition, offset, size)
+        if key is None:
+            return data
+        base = _ncch_ctr_base(header, section, offset)
+        return ctr_decrypt(key, base, ctr_offset, data)
+
+    if exthdr_size:
+        plain = read(0x200, min(0x400, exthdr_size), key_menu, 1)
+        expected = header[0x160:0x180]
+        if any(expected) and len(plain) == 0x400:
+            checks.append(hashlib.sha256(plain).digest() == expected)
+        else:
+            program_id = plain[0x200:0x208] if len(plain) >= 0x208 else b""
+            if program_id and any(program_id):
+                checks.append(program_id == header[0x118:0x120])
+        if checks and not checks[-1]:
+            issues.append("확장 헤더")
+
+    if exefs_size:
+        head = read(exefs_offset, 0x200, key_menu, 2)
+        expected = header[0x1C0:0x1E0]
+        hash_units = int.from_bytes(header[0x1A8:0x1AC], "little")
+        result: bool | None
+        if any(expected) and hash_units == 1:
+            result = hashlib.sha256(head).digest() == expected
+        else:
+            result = _exefs_names_ok(head)
+        if result is not None:
+            checks.append(result)
+            if not result:
+                issues.append("ExeFS")
+
+    if romfs_size:
+        head = read(romfs_offset, min(0x200, romfs_size), key_content, 3)
+        result = head[:4] == b"IVFC"
+        expected = header[0x1E0:0x200]
+        hash_units = int.from_bytes(header[0x1B8:0x1BC], "little")
+        if result and any(expected) and hash_units == 1 and len(head) >= 0x200:
+            result = hashlib.sha256(head).digest() == expected
+        checks.append(result)
+        if not result:
+            issues.append("RomFS")
+
+    if not checks:
+        return None, []
+    return all(checks), issues
+
+
+def _partition_key_pairs(info: NcchCryptoInfo, header: bytes,
+                         keys: Keys) -> list[tuple[bytes, bytes, int | None, int | None]]:
+    """이 파티션을 풀어 볼 (메뉴 키, 본문 키, 슬롯, 슬롯) 후보를 만든다.
+
+    외부 도구가 헤더의 암호 플래그만 바꿔 놓은 파일은 flags3도 지워져 있어서
+    본문 슬롯을 믿을 수 없다. 그래서 keys.txt에 있는 다른 슬롯도 차례로 본다.
+    """
     if info.fixed_key:
         if info.program_id & (0x10 << 32):
             raise ConvertError(
                 "시스템 고정 키로 암호화된 타이틀이라 이 앱에서는 풀 수 없습니다."
             )
-        key_menu = key_content = bytes(16)
-    else:
-        missing = [slot for slot in dict.fromkeys(info.key_slots) if slot not in keys.keyx]
-        if missing:
-            raise ConvertError(_need_keyx_message(missing))
-        if info.seed_crypto:
-            seed = _pick_seed(header, keys)
-            if seed is None:
-                raise ConvertError(_need_seed_message(info.program_id))
-            key_y_content = hashlib.sha256(header[0:16] + seed).digest()[:16]
-        else:
-            key_y_content = header[0:16]
-        key_menu = normal_key(keys.keyx[info.key_slots[0]], header[0:16])
-        key_content = normal_key(keys.keyx[info.key_slots[1]], key_y_content)
+        zero = bytes(16)
+        return [(zero, zero, None, None)]
 
-    exefs_offset = int.from_bytes(header[0x1A0:0x1A4], "little") * MEDIA_UNIT
-    exefs_size = int.from_bytes(header[0x1A4:0x1A8], "little") * MEDIA_UNIT
-    romfs_offset = int.from_bytes(header[0x1B0:0x1B4], "little") * MEDIA_UNIT
-    romfs_size = int.from_bytes(header[0x1B4:0x1B8], "little") * MEDIA_UNIT
+    if info.seed_crypto:
+        seed = _pick_seed(header, keys)
+        if seed is None:
+            raise ConvertError(_need_seed_message(info.program_id))
+        key_y_content = hashlib.sha256(header[0:16] + seed).digest()[:16]
+    else:
+        key_y_content = header[0:16]
+
+    usable = {slot: key for slot, key in keys.keyx.items() if slot != COMMON_KEYX_SLOT}
+    if not usable:
+        missing = list(dict.fromkeys([0x2C, info.key_slots[1]]))
+        raise ConvertError(_need_keyx_message(missing))
+
+    menu_slots = list(dict.fromkeys([0x2C, info.key_slots[0], *sorted(usable)]))
+    content_slots = list(dict.fromkeys(
+        [info.key_slots[1], 0x2C, 0x18, 0x1B, 0x25, *sorted(usable)]))
+    pairs: list[tuple[bytes, bytes, int | None, int | None]] = []
+    seen: set[tuple[bytes, bytes]] = set()
+    for menu_slot in menu_slots:
+        key_x_menu = usable.get(menu_slot)
+        if key_x_menu is None:
+            continue
+        key_menu = normal_key(key_x_menu, header[0:16])
+        for content_slot in content_slots:
+            key_x_content = usable.get(content_slot)
+            if key_x_content is None:
+                continue
+            key_content = normal_key(key_x_content, key_y_content)
+            pair = (key_menu, key_content)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            pairs.append((key_menu, key_content, menu_slot, content_slot))
+    if not pairs:
+        missing = [slot for slot in dict.fromkeys([0x2C, info.key_slots[1]])
+                   if slot not in keys.keyx]
+        raise ConvertError(_need_keyx_message(missing))
+    return pairs
+
+
+def _plan_partition(handle, partition: NcchPartition, keys: Keys,
+                    log=None) -> _PartitionPlan | None:
+    """한 파티션의 복호화 구간을 만들고 키가 맞는지 검증한다."""
+    header = partition.header
+    info = ncch_crypto_info(header)
+
+    if info.flags7 & 0x04:
+        # 외부 변환 도구가 헤더만 "복호화됨"으로 바꿔 두는 경우가 있다.
+        # 플래그를 믿지 말고 실제 영역을 확인하고, 아니면 키로 다시 푼다.
+        ok, issues = _probe_regions(handle, partition, None, None)
+        if ok is not False:
+            return None
+        if log:
+            log(f"NCSD 파티션 {partition.index}: 헤더는 복호화됐다고 되어 있지만 "
+                f"{', '.join(issues)} 내용이 암호화되어 있음. 키로 다시 풀어 봅니다")
+    else:
+        ok, _issues = _probe_regions(handle, partition, None, None)
+        if ok is not False and ok is not None:
+            if log:
+                log(f"NCSD 파티션 {partition.index}: 헤더는 암호화라고 되어 있지만 "
+                    "내용은 이미 복호화되어 있음")
+            return None
+
+    pairs = _partition_key_pairs(info, header, keys)
+    chosen: tuple[bytes, bytes, int | None, int | None] | None = None
+    all_issues: list[str] = []
+    for key_menu, key_content, menu_slot, content_slot in pairs:
+        ok, issues = _probe_regions(handle, partition, key_menu, key_content)
+        if ok is not False:
+            chosen = (key_menu, key_content, menu_slot, content_slot)
+            break
+        all_issues.extend(issue for issue in issues if issue not in all_issues)
+
+    if chosen is None:
+        section = all_issues[0] if all_issues else "확장 헤더"
+        raise ConvertError(_wrong_key_message(
+            info.program_id, section,
+            tried=len(pairs), content_slot=info.key_slots[1]))
+    key_menu, key_content, menu_slot, content_slot = chosen
+    if log and (menu_slot != info.key_slots[0] or content_slot != info.key_slots[1]):
+        log(f"NCSD 파티션 {partition.index}: 실제 키 슬롯은 "
+            f"menu 0x{menu_slot:02X}, 본문 0x{content_slot:02X}")
+
+    unit = ncch_unit(header)
+    exefs_offset = int.from_bytes(header[0x1A0:0x1A4], "little") * unit
+    exefs_size = int.from_bytes(header[0x1A4:0x1A8], "little") * unit
+    romfs_offset = int.from_bytes(header[0x1B0:0x1B4], "little") * unit
+    romfs_size = int.from_bytes(header[0x1B4:0x1B8], "little") * unit
     exthdr_size = int.from_bytes(header[0x180:0x184], "little")
 
     ranges: list[_DecryptRange] = []
     if exthdr_size:
         exthdr = _DecryptRange(
             0x200, 0x800, key_menu, _ncch_ctr_base(header, 1, 0x200), 0)
-        plain = _read_decrypt(handle, partition, exthdr)
-        if hashlib.sha256(plain[:0x400]).digest() != header[0x160:0x180]:
-            raise ConvertError(_wrong_key_message(info.program_id, "확장 헤더"))
         ranges.append(exthdr)
 
     if exefs_size:
         base = _ncch_ctr_base(header, 2, exefs_offset)
         exefs_head = _DecryptRange(exefs_offset, 0x200, key_menu, base, 0)
         plain_head = _read_decrypt(handle, partition, exefs_head)
-        hash_units = int.from_bytes(header[0x1A8:0x1AC], "little")
-        if hash_units <= 1:  # 보통 1(0x200바이트)이다
-            if hashlib.sha256(plain_head).digest() != header[0x1C0:0x1E0]:
-                raise ConvertError(_wrong_key_message(info.program_id, "ExeFS 헤더"))
         ranges.append(exefs_head)
         for index in range(10):
             entry = plain_head[index * 0x10:(index + 1) * 0x10]
@@ -780,14 +991,6 @@ def _plan_partition(handle, partition: NcchPartition, keys: Keys) -> _PartitionP
 
     if romfs_size:
         base = _ncch_ctr_base(header, 3, romfs_offset)
-        first = _read_decrypt(
-            handle, partition,
-            _DecryptRange(romfs_offset, min(romfs_size, 0x200), key_content, base, 0))
-        if first[:4] != b"IVFC":
-            raise ConvertError(_wrong_key_message(info.program_id, "RomFS"))
-        hash_units = int.from_bytes(header[0x1B8:0x1BC], "little")
-        if hash_units == 1 and hashlib.sha256(first).digest() != header[0x1E0:0x200]:
-            raise ConvertError(_wrong_key_message(info.program_id, "RomFS"))
         ranges.append(_DecryptRange(romfs_offset, romfs_size, key_content, base, 0))
 
     patched = bytearray(header)
@@ -813,6 +1016,29 @@ def _merge_ranges(ranges: list[_DecryptRange]) -> list[_DecryptRange]:
     return result
 
 
+def check_plaintext_cci(path: Path) -> list[str]:
+    """복호화됐다고 표시된 CCI의 실제 내용이 정말 평문인지 확인한다.
+
+    외부 변환 도구가 NCCH 헤더의 플래그만 바꿔 놓는 경우가 있어서, 플래그를
+    믿지 않고 확장 헤더/ExeFS/RomFS를 읽어 본다. 문제가 된 영역 이름을 돌려주고,
+    목록이 비어 있으면 그대로 써도 된다.
+    """
+    try:
+        partitions = read_ncsd(path)
+    except ConvertError:
+        return []  # 헤더가 잘린 파일은 크기를 맞춘 뒤에 다시 본다
+    issues: list[str] = []
+    with path.open("rb") as handle:
+        for partition in partitions:
+            info = ncch_crypto_info(partition.header)
+            if not (info.flags7 & 0x04):
+                continue
+            ok, bad = _probe_regions(handle, partition, None, None)
+            if ok is False:
+                issues.extend(issue for issue in bad if issue not in issues)
+    return issues
+
+
 def decrypt_cci(src: Path, dst: Path, keys: Keys, log, progress=None) -> Path:
     """암호화된 CCI를 복호화한 CCI로 새로 쓴다. NCSD 헤더는 그대로 둔다."""
     partitions = read_ncsd(src)
@@ -820,7 +1046,7 @@ def decrypt_cci(src: Path, dst: Path, keys: Keys, log, progress=None) -> Path:
     plans: list[_PartitionPlan] = []
     with src.open("rb") as handle:
         for partition in partitions:
-            plan = _plan_partition(handle, partition, keys)
+            plan = _plan_partition(handle, partition, keys, log)
             if plan is None:
                 log(f"NCSD 파티션 {partition.index}: 이미 복호화되어 있음")
                 continue
@@ -936,6 +1162,9 @@ class CiaInfo:
     common_index: int | None = None
     title_key_index: int | None = None
     key_verified: bool = False
+    title_key_origin: str = ""
+    key_candidates: int = 0
+    bad_contents: tuple[int, ...] = ()
 
     @property
     def program(self) -> CiaContent | None:
@@ -983,31 +1212,51 @@ def _title_key_unlocks(raw: bytes, index: int, title_key: bytes) -> bool:
     return plain[0x100:0x104] == NCCH_MAGIC
 
 
-def _find_title_key(encrypted_key: bytes, ticket_title: int, ticket_data: bytes,
-                    probe: tuple[int, bytes] | None,
-                    keys: Keys) -> tuple[bytes | None, int | None, bool]:
-    """common 키 후보를 차례로 대 보고 실제로 풀리는 것을 고른다.
+def _find_title_key(encrypted_key: bytes, ticket_title: int, tmd_title: int,
+                    ticket_data: bytes, probe: tuple[int, bytes] | None,
+                    keys: Keys) -> tuple[bytes | None, int | None, bool, int, str]:
+    """타이틀 키 후보를 차례로 대 보고 실제로 풀리는 것을 고른다.
 
-    keys.txt의 common0~common5는 KeyY인 경우가 많아서 그대로 쓰면 안 되고,
-    slot0x3DKeyX와 함께 normal key로 만들어야 한다. 어느 쪽이 맞는지는
-    내용 머리가 NCCH로 풀리는지로 확인한다.
+    - 티켓의 타이틀 키가 이미 평문인 CIA도 있어서 그것부터 본다.
+    - common0~common5는 KeyY인 경우가 많아 slot0x3DKeyX와 짝을 맞춘다.
+    - 티켓 타이틀 ID와 TMD 타이틀 ID가 다른 CIA도 있어서 둘 다 시도한다.
+    - 0으로 채워진 키는 후보에서 뺀다.
     """
-    candidates = keys.common_candidates(_ticket_common_index(ticket_data))
+    candidates: list[tuple[bytes, int | None, str]] = []
+    seen: set[bytes] = set()
+
+    def add(key: bytes | None, index: int | None, origin: str) -> None:
+        if key is None or len(key) != 16 or key == bytes(16) or key in seen:
+            return
+        seen.add(key)
+        candidates.append((key, index, origin))
+
+    add(encrypted_key, None, "평문 타이틀 키")
+    common_index = _ticket_common_index(ticket_data)
+    for index, common in keys.common_candidates(common_index):
+        for title in dict.fromkeys((ticket_title, tmd_title)):
+            if not title:
+                continue
+            try:
+                title_key = decrypt_title_key(encrypted_key, title, common)
+            except ConvertError:
+                continue
+            origin = f"common {index}" if index is not None else "common"
+            if title != ticket_title:
+                origin += f" / 타이틀 0x{title:016X}"
+            add(title_key, index, origin)
+
     if not candidates:
-        return None, None, False
+        return None, None, False, 0, ""
     if probe is None:
         # 내용이 너무 짧아 확인할 수 없으면 첫 후보를 그대로 쓴다.
-        index, common = candidates[0]
-        return decrypt_title_key(encrypted_key, ticket_title, common), index, False
+        key, index, origin = candidates[0]
+        return key, index, False, len(candidates), origin
     content_index, raw = probe
-    for index, common in candidates:
-        try:
-            title_key = decrypt_title_key(encrypted_key, ticket_title, common)
-        except ConvertError:
-            continue
-        if _title_key_unlocks(raw, content_index, title_key):
-            return title_key, index, True
-    return None, None, False
+    for key, index, origin in candidates:
+        if _title_key_unlocks(raw, content_index, key):
+            return key, index, True, len(candidates), origin
+    return None, None, False, len(candidates), ""
 
 
 def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
@@ -1101,9 +1350,25 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
     title_key: bytes | None = None
     title_key_index: int | None = None
     key_verified = False
+    title_key_origin = ""
+    key_candidates = 0
     if needs_key and keys is not None:
-        title_key, title_key_index, key_verified = _find_title_key(
-            encrypted_key, ticket_title, ticket_data, probe, keys)
+        title_key, title_key_index, key_verified, key_candidates, title_key_origin = \
+            _find_title_key(
+                encrypted_key, ticket_title, title_id, ticket_data, probe, keys)
+
+    bad_contents: list[int] = []
+    if title_key is not None:
+        # 첫 내용만 맞고 다른 내용이 안 풀리는 경우를 따로 알려준다.
+        with path.open("rb") as handle:
+            for content in contents:
+                if not content.encrypted or content.plaintext or content.size < 0x200:
+                    continue
+                handle.seek(content.offset)
+                raw = handle.read(0x200)
+                if len(raw) == 0x200 and not _title_key_unlocks(raw, content.index, title_key):
+                    bad_contents.append(content.index)
+
     return CiaInfo(
         header_size=header_size,
         title_id=title_id,
@@ -1117,6 +1382,9 @@ def read_cia(path: Path, keys: Keys | None = None) -> CiaInfo:
         common_index=_ticket_common_index(ticket_data),
         title_key_index=title_key_index,
         key_verified=key_verified,
+        title_key_origin=title_key_origin,
+        key_candidates=key_candidates,
+        bad_contents=tuple(bad_contents),
     )
 
 
@@ -1176,6 +1444,8 @@ def decrypt_cia(src: Path, dst: Path, keys: Keys, progress=None) -> Path:
         raise ConvertError("이 CIA는 이미 복호화되어 있습니다.")
     if not info.title_key:
         raise ConvertError(_title_key_error(info, keys))
+    if info.bad_contents:
+        raise ConvertError(_bad_content_message(info))
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     part = dst.with_name(dst.name + ".part")
@@ -1272,6 +1542,8 @@ def cia_to_cci(src: Path, dst: Path, keys: Keys, log, progress=None,
         raise ConvertError("CIA 안에 내용이 없습니다.")
     if info.needs_key and not info.title_key:
         raise ConvertError(_title_key_error(info, keys))
+    if info.bad_contents:
+        raise ConvertError(_bad_content_message(info))
 
     entries: list[tuple[CiaContent, bytes, bytes, int]] = []
     with src.open("rb") as source:
@@ -1413,11 +1685,52 @@ def _need_key_message() -> str:
     )
 
 
+def _bad_content_message(info: CiaInfo) -> str:
+    indices = ", ".join(str(index) for index in info.bad_contents)
+    return (
+        "CIA의 타이틀 키는 풀렸는데 일부 내용이 NCCH로 나오지 않습니다.\n"
+        f"문제가 된 내용 번호: {indices}\n\n"
+        "내용마다 다른 키를 쓰는 파일이거나, 중간이 손상된 CIA일 수 있습니다.\n"
+        "콘솔에서 덤프한 원본 CIA인지 확인하고, 가능하면 다시 덤프해 보세요."
+    )
+
+
 def _title_key_error(info: CiaInfo, keys: Keys) -> str:
     """타이틀 키를 못 풀었을 때: 키가 아예 없는지, 있는데 안 맞는지 구분한다."""
-    if keys.has_common():
-        return _wrong_common_message(info.title_id, info.common_index)
-    return _need_key_message()
+    if not keys.has_common():
+        if not keys.path and not keys.keyx:
+            return _need_key_message()
+        return (
+            "keys.txt는 읽었는데 CIA를 풀 공통 키(common0~common5)가 없습니다.\n\n"
+            + "\n".join(keys.summary())
+            + "\n\nDumpKeys로 만든 aes_keys.txt를 쓰거나, common0~common5와 "
+            "slot0x3DKeyX를 같이 넣어 주세요."
+        )
+    key_x = keys.keyx.get(COMMON_KEYX_SLOT) or keys.keyx.get(COMMON_KEYX_SLOT - 1)
+    if keys.common_y and key_x is None:
+        return (
+            "keys.txt에 common0~common5(KeyY)는 있는데 slot0x3DKeyX가 없습니다.\n"
+            "KeyY만으로는 normal key를 만들 수 없어서 타이틀 키를 풀지 못합니다.\n\n"
+            + "\n".join(keys.summary())
+            + "\n\nGodMode9에서 DumpKeys를 다시 실행해 slot0x3DKeyX 줄을 "
+            "같이 받아 주세요."
+        )
+    lines = [
+        "CIA의 타이틀 키를 풀지 못했습니다.",
+        "",
+        f"  티켓 common 인덱스: {info.common_index if info.common_index is not None else '알 수 없음'}",
+        f"  시도한 키 후보: {info.key_candidates}개",
+    ]
+    lines += keys.summary()
+    lines += [
+        "",
+        "common0~common5는 보통 KeyY입니다. slot0x3DKeyX와 짝을 맞춰 normal key를 "
+        "만들어야 하고, 두 줄이 다 있어야 합니다.",
+        "타이틀 키가 평문으로 들어 있는 CIA도 있어서 그 경로도 시도했지만 풀리지 않았습니다.",
+        f"타이틀 0x{info.title_id:016X}의 원본 CIA가 맞는지, 콘솔에서 덤프한 그대로인지도 "
+        "확인해 주세요. 중간에 손댄 파일이면 키가 맞아도 이렇게 나옵니다.",
+    ]
+    return "\n".join(lines)
 
 
 def _wrong_common_message(title_id: int, common_index: int | None) -> str:
@@ -1460,11 +1773,20 @@ def _need_seed_message(title_id: int) -> str:
     )
 
 
-def _wrong_key_message(title_id: int, section: str) -> str:
+def _wrong_key_message(title_id: int, section: str, tried: int = 0,
+                       content_slot: int | None = None) -> str:
+    detail = ""
+    if content_slot is not None:
+        detail += f"\n헤더가 가리키는 본문 키 슬롯: 0x{content_slot:02X}"
+    if tried:
+        detail += f"\n시도한 키 조합: {tried}개"
     return (
         f"{section}를 풀었는데 내용이 맞지 않습니다.\n\n"
         f"타이틀 0x{title_id:016X}에 맞는 키(keyX/시드)인지 확인해 주세요. "
         "콘솔에서 덤프한 원본 그대로인지도 같이 봐야 합니다."
+        f"{detail}\n\n"
+        "헤더의 암호 플래그만 바꾼 파일이라면 내용은 아직 암호화되어 있습니다. "
+        "keys.txt에 slot0x2CKeyX와 본문 슬롯 keyX를 넣으면 다시 풀어 봅니다."
     )
 
 

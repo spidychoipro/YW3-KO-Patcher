@@ -360,7 +360,8 @@ def make_fake_ncch(title_id: int, size: int = 0x4000) -> bytes:
 
 
 def build_fake_cia(path: Path, ncch: bytes, title_id: int, title_key: bytes,
-                   common_key: bytes, encrypt: bool, aligned: bool = True) -> Path:
+                   common_key: bytes, encrypt: bool, aligned: bool = True,
+                   plain_ticket_key: bool = False) -> Path:
     header_size = 0x2020
     cert = bytearray(0x400)
     cert[0:4] = (0x00010003).to_bytes(4, "big")
@@ -368,7 +369,8 @@ def build_fake_cia(path: Path, ncch: bytes, title_id: int, title_key: bytes,
     ticket = bytearray(0x140 + 0x210)
     ticket[0:4] = (0x00010004).to_bytes(4, "big")
     iv = title_id.to_bytes(8, "big") + b"\x00" * 8
-    ticket[0x140 + 0x7F:0x140 + 0x8F] = converter.cbc_encrypt(common_key, iv, title_key)
+    stored = title_key if plain_ticket_key else converter.cbc_encrypt(common_key, iv, title_key)
+    ticket[0x140 + 0x7F:0x140 + 0x8F] = stored
     ticket[0x140 + 0x9C:0x140 + 0xA4] = title_id.to_bytes(8, "big")
     ticket = bytes(ticket)
 
@@ -475,6 +477,37 @@ def test_converter(work: Path) -> None:
     check_cci(legacy_cci, ncch, title_id)
     assert legacy_cci.read_bytes() == cci_from_plain.read_bytes(), "예전 CIA 변환 결과가 다름"
     print("[ok] 0x40 정렬 안 한 예전 CIA도 읽음")
+
+    # 티켓에 타이틀 키가 평문으로 들어 있는 CIA (common 키 없이도 풀려야 함)
+    plain_key_cia = build_fake_cia(
+        work / "평문키.cia", ncch, title_id, title_key, common_key, True,
+        plain_ticket_key=True)
+    plain_key_info = converter.read_cia(plain_key_cia, converter.Keys())
+    assert plain_key_info.title_key == title_key, "평문 타이틀 키를 못 찾음"
+    assert plain_key_info.title_key_origin == "평문 타이틀 키", plain_key_info.title_key_origin
+    plain_key_cci = converter.cia_to_cci(
+        plain_key_cia, work / "평문키.cci", converter.Keys(),
+        lambda m: None, lambda p: None)
+    check_cci(plain_key_cci, ncch, title_id)
+    print("[ok] 티켓에 평문으로 든 타이틀 키도 사용")
+
+    # 티켓 타이틀 ID와 TMD 타이틀 ID가 다른 CIA (TMD 쪽으로도 풀어야 함)
+    raw = bytearray(enc_cia.read_bytes())
+    head = raw[:0x2020]
+    layout = _cia_layout(0x2020,
+                         int.from_bytes(head[0x08:0x0C], "little"),
+                         int.from_bytes(head[0x0C:0x10], "little"),
+                         int.from_bytes(head[0x10:0x14], "little"))
+    ticket_at = layout[1]
+    other_title = 0x00040000001AF401
+    raw[ticket_at + 0x140 + 0x9C:ticket_at + 0x140 + 0xA4] = other_title.to_bytes(8, "big")
+    mismatch_cia = work / "티켓불일치.cia"
+    mismatch_cia.write_bytes(bytes(raw))
+    mismatch_info = converter.read_cia(mismatch_cia, keys)
+    assert mismatch_info.title_key == title_key, "TMD 타이틀 ID로 타이틀 키를 못 풀음"
+    assert mismatch_info.key_verified, "키 검증이 통과로 기록되지 않음"
+    assert f"0x{title_id:016X}" in mismatch_info.title_key_origin, mismatch_info.title_key_origin
+    print("[ok] 티켓/TMD 타이틀 ID가 달라도 맞는 쪽으로 복호화")
 
     ncch_file = work / "본편.app"
     ncch_file.write_bytes(ncch)
@@ -615,7 +648,7 @@ def test_cci_decrypt(work: Path) -> None:
         assert info.key_slots == (0x2C, 0x18), f"{label}: 키 슬롯 {info.key_slots}"
         print(f"[ok] CCI 복호화 — {label}")
 
-    enc_path, _expected, keys = enc_paths["crypto_0_std"]
+    enc_path, std_expected, keys = enc_paths["crypto_0_std"]
     try:
         converter.decrypt_cci(enc_path, work / "no_key.cci", converter.Keys(),
                               lambda message: None, lambda percent: None)
@@ -656,6 +689,31 @@ def test_cci_decrypt(work: Path) -> None:
         print("[ok] keyX가 틀릴 때 안내")
     else:
         raise AssertionError("keyX가 틀렸는데 복호화가 됐다")
+
+    # 외부 변환 도구가 헤더의 암호 플래그만 지운 파일: 플래그를 믿지 말고
+    # 실제 확장 헤더를 보고 다시 풀어야 한다.
+    fake = work / "fake_plain.cci"
+    data = bytearray(enc_path.read_bytes())
+    data[0x4000 + 0x18F] |= 0x04
+    fake.write_bytes(bytes(data))
+    messages: list[str] = []
+    fixed = converter.decrypt_cci(
+        fake, work / "fake_plain_dec.cci", keys,
+        messages.append, lambda percent: None)
+    assert fixed.read_bytes() == std_expected, "플래그만 바뀐 CCI를 다시 풀지 못함"
+    assert any("다시 풀어" in message for message in messages), messages
+    print("[ok] 암호 플래그만 바뀐 CCI는 내용을 확인해 다시 복호화")
+
+    repair_role = app.Role(
+        key="base", label="본편", patch_name="x", patch_size=1,
+        patch_sha256="0" * 64, result_name="repair.cci", result_size=1,
+        result_sha256="0" * 64)
+    prepared = app.prepare_source(
+        repair_role, fake, work, keys,
+        lambda m: None, lambda s: None, lambda p: None, check_profile=False)
+    assert prepared.converted, prepared
+    assert prepared.path.read_bytes() == std_expected, "prepare_source가 다시 풀지 못함"
+    print("[ok] prepare_source가 플래그만 바뀐 CCI를 자동 복호화")
 
     decrypted = work / "crypto_0_std_dec.cci"
     try:
@@ -843,7 +901,7 @@ def test_prepare_pipeline(exe: Path, work: Path) -> None:
         cia = build_fake_cia(work / f"pipe_{encrypt}.cia", ncch, title_id, title_key, common_key, encrypt)
         prepared = app.prepare_source(
             app.BASE, cia, work, keys,
-            lambda m: None, lambda s: None, lambda p: None)
+            lambda m: None, lambda s: None, lambda p: None, check_profile=False)
         assert prepared.converted, "CIA인데 변환으로 표시되지 않음"
         assert prepared.path.read_bytes() == reference.read_bytes(), "변환 결과가 기준 CCI와 다름"
         prepared.path.unlink()
@@ -855,7 +913,7 @@ def test_prepare_pipeline(exe: Path, work: Path) -> None:
         work, "pipe_enc.cci", plain_ncch, 0, 0x0A, seed)
     prepared = app.prepare_source(
         app.BASE, enc_cci, work, cci_keys,
-        lambda m: None, lambda s: None, lambda p: None)
+        lambda m: None, lambda s: None, lambda p: None, check_profile=False)
     assert prepared.converted, "암호화 CCI인데 변환으로 표시되지 않음"
     assert prepared.path.read_bytes() == expected_cci, "암호화 CCI 복호화 결과가 다름"
     prepared.path.unlink()
@@ -907,7 +965,7 @@ def test_trimmed_cci(exe: Path, work: Path) -> None:
     )
     prepared = app.prepare_source(
         role, trimmed, work, converter.Keys(),
-        lambda m: None, lambda s: None, lambda p: None)
+        lambda m: None, lambda s: None, lambda p: None, check_profile=False)
     assert prepared.converted and prepared.padded_from == 0x1000, prepared
     assert prepared.path.stat().st_size == reference.stat().st_size, "원본 크기로 못 채움"
 
@@ -1017,6 +1075,60 @@ def test_multi_content(work: Path) -> None:
     print("[ok] 모자란 CCI는 카트리지 크기까지 0으로 채움")
 
 
+def test_profile_check(work: Path) -> None:
+    """공식 manifest 해시와 영역이 다르면 어디가 다른지 짚어 주는지 확인한다."""
+    title_id = app.YW3_BASE_TITLE
+    plain = make_crypto_ncch(title_id, None)
+    ncch_file = work / "prof.app"
+    ncch_file.write_bytes(plain)
+    cci = converter.ncch_to_cci(ncch_file, work / "prof.cci",
+                                lambda m: None, lambda p: None)
+
+    specs = []
+    for region in converter.ncch_regions(plain[:0x200]):
+        digest = sha256_bytes(plain[region.offset:region.offset + region.size])
+        specs.append(app.profiles.RegionSpec(region.name, region.size, digest))
+    profile = app.profiles.Profile(
+        role="base", parts=(app.profiles.PartSpec(0, title_id, "", tuple(specs)),))
+
+    role = app.Role(
+        key="base", label="본편", patch_name="x", patch_size=1,
+        patch_sha256="0" * 64, result_name="prof_out.cci", result_size=1,
+        result_sha256="0" * 64)
+
+    saved = app.profiles.PROFILES
+    app.profiles.PROFILES = {"base": profile}
+    try:
+        issues = app.check_source_profile(
+            cci, role, converter.Keys(), lambda m: None, lambda s: None)
+        assert not issues, issues
+        prepared = app.prepare_source(
+            role, cci, work, converter.Keys(),
+            lambda m: None, lambda s: None, lambda p: None)
+        assert prepared.path == cci, prepared
+        print("[ok] 게임 영역 해시가 공식 manifest와 일치")
+
+        part0 = converter.read_ncsd(cci)[0]
+        bad = bytearray(cci.read_bytes())
+        bad[part0.offset + 0x1000 + 0x10] ^= 0xFF  # ExeFS 첫 블록
+        bad_path = work / "prof_bad.cci"
+        bad_path.write_bytes(bytes(bad))
+        issues = app.check_source_profile(
+            bad_path, role, converter.Keys(), lambda m: None, lambda s: None)
+        assert issues and "ExeFS" in issues[0], issues
+        try:
+            app.prepare_source(
+                role, bad_path, work, converter.Keys(),
+                lambda m: None, lambda s: None, lambda p: None)
+        except app.PatchError as exc:
+            assert "ExeFS" in str(exc) and "0xC3000" in str(exc), str(exc)
+            print("[ok] ExeFS가 다르면 0xC3000 안내와 함께 중단")
+        else:
+            raise AssertionError("영역이 다른데 prepare_source가 통과됨")
+    finally:
+        app.profiles.PROFILES = saved
+
+
 def test_window_verify(exe: Path, work: Path) -> None:
     """변환본 패치 검사: 헤더만 다르면 통과, 내용이 다르면 거부."""
     source = work / "win_ref.bin"
@@ -1100,6 +1212,7 @@ def main() -> int:
         test_prepare_pipeline(exe, work)
         test_trimmed_cci(exe, work)
         test_multi_content(work)
+        test_profile_check(work)
         test_window_verify(exe, work)
         test_ui_states(work)
         test_gui()
