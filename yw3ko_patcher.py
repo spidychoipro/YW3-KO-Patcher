@@ -37,7 +37,7 @@ import yw3updates as updates
 import yw3verify as container_verify
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -1262,7 +1262,7 @@ class PatcherApp(tk.Tk):
         threading.Thread(target=self._worker, args=(base, update, out_dir, keys), daemon=True).start()
 
     def _worker(self, base: Path, update: Path, out_dir: Path, keys: converter.Keys) -> None:
-        work_dir = out_dir / "_YW3_KO_work"
+        work_dir: Path | None = None
         try:
             self._emit("patch_version", "한글 패치: 공식 최신 버전 확인 중...")
             self._status("공식 최신 한글 패치 확인 중...")
@@ -1278,7 +1278,7 @@ class PatcherApp(tk.Tk):
             self._emit("patch_version", version_label)
             exe = ensure_xdelta(self._log, on_prep)
             patches = {role.key: ensure_patch(role, self._log, on_prep) for role in roles}
-            work_dir.mkdir(parents=True, exist_ok=True)
+            work_dir = Path(tempfile.mkdtemp(prefix="_YW3_KO_work_", dir=out_dir))
 
             plans = (
                 (roles[0], base, 9.0, 28.0, 28.0, 60.0),
@@ -1303,7 +1303,7 @@ class PatcherApp(tk.Tk):
                     allow_header=prepared.allow_header,
                     padded_from=prepared.padded_from,
                 ))
-                if prepared.converted:
+                if prepared.converted and prepared.path.resolve().is_relative_to(work_dir.resolve()):
                     prepared.path.unlink(missing_ok=True)
                 if report.get("payload_verified"):
                     notes.append(f"{role.label}: 공식 완성본의 게임 영역과 내부 해시를 확인했습니다.")
@@ -1321,7 +1321,8 @@ class PatcherApp(tk.Tk):
             self._log(f"예기치 않은 오류: {exc!r}")
             self._emit("done", False, f"예기치 않은 오류가 났습니다.\n{exc}")
         finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
+            if work_dir is not None and work_dir.resolve().is_relative_to(out_dir.resolve()):
+                shutil.rmtree(work_dir, ignore_errors=True)
             self._emit("busy", False)
 
     def _reset_cache(self) -> None:
