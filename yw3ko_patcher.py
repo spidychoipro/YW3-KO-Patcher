@@ -38,7 +38,7 @@ import yw3verify as container_verify
 import yw3external as external
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -482,12 +482,17 @@ def _check_windows(part: Path, windows, progress) -> tuple[str, list[tuple[int, 
     return digest.hexdigest().lower(), bad
 
 
+def _required_source_name(role: Role) -> str:
+    """역할별로 요구하는 원본 버전 이름. 오류 문구가 v0으로 고정되지 않게 한다."""
+    return "Update 4.0" if role.key == "update" else "일본판 요괴워치3 스키야키 v0"
+
+
 def _explain_mismatch(role: Role, bad: list[tuple[int, int]]) -> str:
     ranges = ", ".join(f"0x{offset:X}" for offset, _length in bad[:4])
     return (
         f"{role.label} 패치 결과가 공식 원본과 달라서 저장하지 않았습니다.\n\n"
         f"크기는 맞지만 내용이 다른 구간이 있어요: {ranges}\n\n"
-        "요괴워치3 스키야키 일본판 v0이 맞는지 확인해 주세요. "
+        f"{_required_source_name(role)}이 맞는지 확인해 주세요. "
         "본편 자리에 업데이트를 넣었거나, 다른 지역·버전 파일이면 이렇게 됩니다. "
         "이미 한글 패치한 파일을 원본으로 넣어도 이렇게 나옵니다.\n"
         "표시된 오프셋은 패치 창의 시작 위치입니다. 그 위치만으로 ExeFS 손상을 판단할 수 없습니다."
@@ -823,7 +828,7 @@ def check_source_profile(path: Path, role: Role, keys: converter.Keys,
 
 def _profile_error(role: Role, issues: list[str]) -> str:
     lines = [
-        f"{role.label} 원본이 공식 배포본(v0)과 다릅니다.",
+        f"{role.label} 원본이 공식 배포본({_required_source_name(role)})과 다릅니다.",
         "",
     ]
     lines += [f"- {issue}" for issue in issues]
@@ -1038,7 +1043,7 @@ def _explain_failure(role: Role, returncode: int, raw: bytes) -> str:
             f"{role.label} 원본이 패치 대상 버전과 다릅니다.\n\n"
             "xdelta3 메시지:\n"
             f"{text}\n\n"
-            "일본판 요괴워치3 스키야키 v0인지 확인해 주세요. "
+            f"{_required_source_name(role)}인지 확인해 주세요. "
             "본편은 복호화 CCI나 CIA(hshop 본편 포함), 업데이트는 Update 4.0 CIA여야 합니다. "
             "다른 지역판이나 다른 버전이면 크기·내용이 달라서 거부됩니다.\n"
             "다른 도구로 CCI를 만들었다면, 변환 전 원본(CIA)을 그대로 넣어 보세요."
