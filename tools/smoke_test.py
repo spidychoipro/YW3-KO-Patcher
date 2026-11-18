@@ -141,6 +141,7 @@ def test_apply_roundtrip(exe: Path, work: Path) -> None:
 def test_gui() -> None:
     gui = app.PatcherApp()
     gui.update()
+    assert gui.update_button.cget("text") == "업데이트 확인", "업데이트 확인 버튼이 없음"
     gui._show_key_help()
     gui.update()
     for child in gui.winfo_children():
