@@ -721,6 +721,111 @@ def read_ncsd(path: Path) -> list[NcchPartition]:
     return partitions
 
 
+@dataclass(frozen=True)
+class NcsdContainer:
+    """GodMode9이 보는 NCSD 헤더 값. 게임 내용은 읽지 않는다."""
+
+    file_size: int
+    size_units: int
+    card_size_bytes: int
+    media_id: bytes
+    fs_type_zero: bool
+    partitions: tuple[tuple[int, int], ...]  # (시작 유닛, 크기 유닛)
+
+    @property
+    def size_bytes(self) -> int:
+        return self.size_units * MEDIA_UNIT
+
+    @property
+    def partition_end_units(self) -> int:
+        return max((offset + size for offset, size in self.partitions if size), default=0)
+
+    @property
+    def partition_end_bytes(self) -> int:
+        return self.partition_end_units * MEDIA_UNIT
+
+    def structural_issues(self) -> list[str]:
+        """ValidateNcsdHeader + IdentifyFileType에서 파일을 GC 제외하는 조건."""
+        issues: list[str] = []
+        if not self.fs_type_zero:
+            issues.append("NCSD 파티션 FS 종류가 0이 아닙니다")
+        if not any(self.media_id):
+            issues.append("NCSD 미디어 ID가 0입니다")
+        if not self.partitions or not self.partitions[0][1]:
+            issues.append("NCSD 첫 파티션이 없습니다")
+        cursor = 0
+        for offset, size in self.partitions:
+            if not size:
+                continue
+            if offset < cursor:
+                issues.append("NCSD 파티션이 겹치거나 순서가 바뀌었습니다")
+                break
+            if (offset + size) * MEDIA_UNIT > self.file_size:
+                issues.append("NCSD 파티션이 파일 끝을 넘어갑니다")
+                break
+            cursor = offset + size
+        return issues
+
+
+def read_ncsd_container(path: Path) -> NcsdContainer:
+    """파티션 크기를 보정하지 않고 NCSD 헤더에 적힌 값을 그대로 읽는다."""
+    total = path.stat().st_size
+    with path.open("rb") as handle:
+        head = handle.read(CCI_HEADER_SIZE)
+    if len(head) < CCI_HEADER_SIZE:
+        raise ConvertError("CCI 헤더가 잘렸습니다.")
+    if head[0x100:0x104] != b"NCSD":
+        raise ConvertError("NCSD(CCI) 헤더가 아닙니다.")
+    partitions = tuple(
+        (int.from_bytes(head[0x120 + index * 8:0x124 + index * 8], "little"),
+         int.from_bytes(head[0x124 + index * 8:0x128 + index * 8], "little"))
+        for index in range(NCSD_PARTITIONS)
+    )
+    return NcsdContainer(
+        file_size=total,
+        size_units=int.from_bytes(head[0x104:0x108], "little"),
+        card_size_bytes=int.from_bytes(head[0x300:0x304], "little"),
+        media_id=head[0x108:0x110],
+        fs_type_zero=head[0x110:0x118] == bytes(8),
+        partitions=partitions)
+
+
+def validate_ncsd_container(path: Path) -> NcsdContainer:
+    """구조가 잘못된 CCI를 결과로 저장하지 않게 막는다."""
+    info = read_ncsd_container(path)
+    issues = info.structural_issues()
+    if issues:
+        raise ConvertError("사용할 수 없는 CCI 컨테이너입니다: " + ", ".join(issues))
+    return info
+
+
+def repair_ncsd_size(path: Path, log=None) -> tuple[int, int]:
+    """NCSD 선언 크기가 파티션 끝보다 작으면 헤더 두 칸만 고친다.
+
+    xdelta 결과가 공식 완성본과 같아도 원본 CIA로 만든 CCI는 선언 크기가
+    작을 수 있다. GodMode9는 선언 크기가 파티션 끝보다 작으면 NCSD로
+    인식하지 않으므로 0x104와 카드 정보의 0x300만 맞춘다.
+    게임 영역·NCCH 헤더·서명은 건드리지 않는다.
+    """
+    info = validate_ncsd_container(path)
+    old = info.size_units
+    new = max(old, info.partition_end_units)
+    card = max(info.card_size_bytes, new * MEDIA_UNIT)
+    if card > 0xFFFFFFFF:
+        card = info.card_size_bytes
+    if new == old and card == info.card_size_bytes:
+        return old, old
+    with path.open("r+b") as handle:
+        handle.seek(0x104)
+        handle.write(new.to_bytes(4, "little"))
+        handle.seek(0x300)
+        handle.write(card.to_bytes(4, "little"))
+    if log is not None:
+        log(f"NCSD 선언 크기 보정: {old:,} → {new:,} 유닛 "
+            f"({info.size_bytes:,} → {new * MEDIA_UNIT:,}바이트, GodMode9 인식용)")
+    return old, new
+
+
 def _ncch_ctr_base(header: bytes, section: int, section_start: int) -> int:
     """GetNcchCtr와 같은 초기 카운터를 만든다.
 

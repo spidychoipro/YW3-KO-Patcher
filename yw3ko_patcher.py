@@ -38,7 +38,7 @@ import yw3verify as container_verify
 import yw3external as external
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -494,6 +494,12 @@ def _explain_mismatch(role: Role, bad: list[tuple[int, int]]) -> str:
     )
 
 
+def _is_ncsd(path: Path) -> bool:
+    with path.open("rb") as handle:
+        handle.seek(0x100)
+        return handle.read(4) == b"NCSD"
+
+
 def apply_patch(role: Role, source: Path, out_dir: Path, exe: Path, patch: Path, overwrite: bool,
                 verify: bool, log, progress, status, strict: bool | None = None,
                 report: dict | None = None, allow_header: bool = False,
@@ -620,6 +626,18 @@ def apply_patch(role: Role, source: Path, out_dir: Path, exe: Path, patch: Path,
                 log(f"[{role.label}] 게임 영역 검증을 통과한 호환 결과를 저장합니다." if payload_mode
                     else f"[{role.label}] 변환본의 창 단위 검사를 통과했습니다.")
         progress(100)
+        if _is_ncsd(part):
+            # 해시/게임 영역 검증은 패치 결과 그대로 확인했다. 이제 GodMode9가
+            # NCSD로 알아보도록 컨테이너 선언 크기만 고쳐서 저장한다.
+            status("CCI 컨테이너 크기 확인 중...")
+            try:
+                old_size, new_size = converter.repair_ncsd_size(part, log)
+            except converter.ConvertError as exc:
+                raise PatchError(
+                    f"{role.label} 결과 CCI 컨테이너가 올바르지 않습니다.\n{exc}") from exc
+            if new_size != old_size and report is not None:
+                report["ncsd_size_repaired"] = True
+                report["ncsd_size_units"] = new_size
         os.replace(part, final)
     except Exception:
         part.unlink(missing_ok=True)
