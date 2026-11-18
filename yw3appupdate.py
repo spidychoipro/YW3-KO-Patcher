@@ -253,5 +253,6 @@ def launch_updater(cache: Path, target: Path, source: Path, release: AppRelease,
         "-ReleaseUrl", release.page,
         "-Log", str(log_path),
     ]
-    flags = CREATE_NO_WINDOW | getattr(subprocess, "DETACHED_PROCESS", 0)
-    return subprocess.Popen(args, creationflags=flags, close_fds=True)
+    # DETACHED_PROCESS를 같이 쓰면 PowerShell이 조용히 종료되는 경우가 있어
+    # CREATE_NO_WINDOW만 쓴다. 부모가 끝나도 자식 프로세스는 그대로 남는다.
+    return subprocess.Popen(args, creationflags=CREATE_NO_WINDOW, close_fds=True)
