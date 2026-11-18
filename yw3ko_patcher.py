@@ -287,6 +287,14 @@ class PatchError(Exception):
     """사용자에게 그대로 보여줄 오류."""
 
 
+class ProfileMismatch(PatchError):
+    """공식 원본/결과 프로필과 게임 영역이 다를 때. 자동 재시도 판단에 쓴다."""
+
+    def __init__(self, message: str, issues: list[str]) -> None:
+        super().__init__(message)
+        self.issues = list(issues)
+
+
 def cache_dir() -> Path:
     override = os.environ.get(CACHE_ENV)
     if override:
@@ -779,7 +787,9 @@ def check_source_profile(path: Path, role: Role, keys: converter.Keys,
                 log(f"[{role.label}] {name} 확인 중...")
                 digest = _hash_at(handle, absolute, found.size)
                 if digest != wanted.sha256:
-                    soft.append(f"{name} 내용이 공식 원본과 다릅니다")
+                    soft.append(
+                        f"{name} 내용이 공식 원본과 다릅니다 "
+                        f"(계산값 {digest}, 공식 {wanted.sha256})")
 
             if main_part or target:
                 issues.extend(soft)
@@ -841,24 +851,80 @@ def _finish(role: Role, prepared: PreparedSource, keys: converter.Keys,
     issues = check_source_profile(
         prepared.path, role, keys, log, status, prepared.padded_from)
     if issues:
-        raise PatchError(_profile_error(role, issues))
+        raise ProfileMismatch(_profile_error(role, issues), issues)
     compatible = role.target_profile is not None
     if compatible:
         log(f"[{role.label}] 게임 영역이 동일한 호환 원본입니다. 결과 게임 영역도 검증합니다.")
     return replace(prepared, compatibility=compatible, profile_verified=True)
 
 
+def _save_diagnostic(source: Path, role: Role, issues: list[str], detail: str = "") -> Path:
+    """실패한 원인을 키/롬 내용 없이 캐시에 남긴다. 사용자가 붙여넣을 수 있게 경로를 알려준다."""
+    try:
+        info = inspect_rom(source)
+        kind = info.kind
+        encrypted = info.encrypted
+        title = (f"0x{info.title_id:016X}" if info.title_id else "알 수 없음")
+        note = info.note
+    except Exception as exc:  # noqa: BLE001 - 진단 저장이 실패를 가리면 안 된다
+        kind = "알 수 없음"
+        encrypted = None
+        title = "알 수 없음"
+        note = f"헤더 확인 실패: {exc}"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = cache_dir() / f"diagnostic_{stamp}.txt"
+    lines = [
+        "요괴워치3 한국어 패치 진단 기록",
+        f"앱 버전: {APP_VERSION}",
+        f"역할: {role.key} ({role.label})",
+        f"패치 파일: {role.patch_name}",
+        f"패치 SHA-256: {role.patch_sha256}",
+        f"입력 파일: {source.name}",
+        f"입력 크기: {source.stat().st_size if source.exists() else '알 수 없음'}",
+        f"컨테이너: {kind}, 암호화: {encrypted}, 타이틀: {title}",
+        f"헤더 메모: {note}",
+        "키 파일/키 값은 기록하지 않습니다.",
+        "",
+        "게임 영역 불일치:",
+    ]
+    lines += [f"- {issue}" for issue in issues]
+    if detail:
+        lines += ["", f"추가 정보: {detail}"]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys, log, status,
                    progress, check_profile: bool = True) -> PreparedSource:
     """패치에 쓸 파일을 준비한다. 필요하면 복호화·CCI 변환까지 한다."""
     info = inspect_rom(path)
+    external_retried = False
 
-    def finish(prepared: PreparedSource) -> PreparedSource:
+    def finish(prepared: PreparedSource,
+               allow_external_retry: bool = True) -> PreparedSource:
+        nonlocal external_retried
         if not check_profile:
             return prepared
-        return _finish(role, prepared, keys, log, status)
+        try:
+            return _finish(role, prepared, keys, log, status)
+        except ProfileMismatch as exc:
+            # 키 파일이 있어 내장 복호화를 썼는데 안쪽 NCCH 암호가 남는 CIA가 있다.
+            # 이때는 검증 실패를 사용자 파일 탓으로 끝내지 말고 자동 도구로 한 번 더 푼다.
+            can_retry = (
+                allow_external_retry
+                and not external_retried
+                and info.kind == "cia"
+                and bool(info.encrypted)
+                and (keys.has_common() or bool(keys.keyx))
+            )
+            if can_retry:
+                external_retried = True
+                log(f"[{role.label}] 내장 복호화 결과가 공식 원본과 달라 자동 복호화 도구로 다시 시도합니다.")
+                return prepare_external(retry=False)
+            diagnostic = _save_diagnostic(path, role, exc.issues)
+            raise PatchError(f"{exc}\n\n진단 기록을 저장했습니다: {diagnostic}") from exc
 
-    def prepare_external() -> PreparedSource:
+    def prepare_external(retry: bool = True) -> PreparedSource:
         status(f"{role.label} CIA를 자동 복호화하는 중...")
         result = external.prepare(path, role.key, work_dir, cache_dir(), download, log,
                                   min_size=role.source_size if role.key == 'base' else 0)
@@ -866,7 +932,7 @@ def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys,
         if padded is not None and padded >= result.stat().st_size:
             padded = None
         return finish(PreparedSource(result, True, allow_header=role.key == 'base',
-                                     padded_from=padded))
+                                     padded_from=padded), allow_external_retry=retry)
 
     try:
         if (info.kind == "cia" and info.encrypted
@@ -939,7 +1005,7 @@ def prepare_source(role: Role, path: Path, work_dir: Path, keys: converter.Keys,
         if isinstance(exc, converter.ConvertError) and info.kind == 'cia' and info.encrypted:
             log(f"[{role.label}] 내장 CIA 복호화에 실패해 자동 도구로 다시 시도합니다.")
             try:
-                return prepare_external()
+                return prepare_external(retry=False)
             except external.ExternalError as fallback:
                 raise PatchError(str(fallback)) from fallback
         raise PatchError(str(exc)) from exc
