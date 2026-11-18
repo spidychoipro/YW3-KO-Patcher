@@ -221,7 +221,10 @@ def write_fake_ncch(buffer: bytearray, offset: int, title_id: int, encrypted: bo
 def make_fake_cci(work: Path, name: str, title_id: int, encrypted: bool) -> Path:
     data = bytearray(0x4000)
     data[0x100:0x104] = b"NCSD"
+    struct.pack_into("<I", data, 0x104, 0x20)  # 파일 크기(미디어 유닛)
+    data[0x108:0x110] = title_id.to_bytes(8, "big")  # GodMode9이 요구하는 미디어 ID
     struct.pack_into("<I", data, 0x120, 1)  # 파티션 0은 미디어 유닛 1(0x200)
+    struct.pack_into("<I", data, 0x124, 0x1F)  # 파티션 끝 = 파일 끝
     write_fake_ncch(data, 0x200, title_id, encrypted)
     path = work / name
     path.write_bytes(data)
