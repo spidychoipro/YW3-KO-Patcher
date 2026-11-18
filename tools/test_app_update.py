@@ -121,7 +121,9 @@ class AppUpdateTests(unittest.TestCase):
             self.assertIn('Hidden', args)
             self.assertIn('-ParentPid', args)
             self.assertIn('4321', args)
-            self.assertTrue(popen.call_args.kwargs['creationflags'] & appupdate.CREATE_NO_WINDOW)
+            flags = popen.call_args.kwargs['creationflags']
+            self.assertTrue(flags & appupdate.CREATE_NO_WINDOW)
+            self.assertFalse(flags & getattr(appupdate.subprocess, 'DETACHED_PROCESS', 0))
 
     def test_gui_has_update_button_and_manual_check(self):
         gui = app.PatcherApp()
