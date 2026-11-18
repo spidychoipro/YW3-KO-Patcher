@@ -89,7 +89,9 @@ class UpdatesTests(unittest.TestCase):
         self.assertEqual(bundle.version, 'v1.01')
         self.assertIn('공식 최신', label)
 
-    def test_versions_do_not_share_same_named_patch_cache(self):
+    def test_new_version_removes_old_patch_cache_but_keeps_created_roms(self):
+        old_rom = self.root / 'old_result.cci'
+        old_rom.write_bytes(b'already patched rom')
         paths = []
         for version in ('v1.01', 'v1.02'):
             _, download = self.release(version)
@@ -97,8 +99,31 @@ class UpdatesTests(unittest.TestCase):
                 roles, _ = app.resolve_patch_roles(self.log)
             paths.append(app.ensure_patch(roles[0], self.log))
         self.assertNotEqual(paths[0], paths[1])
-        self.assertEqual(paths[0].read_bytes(), b'v1.01base')
+        self.assertFalse(paths[0].exists(), '이전 버전 패치 파일이 남았습니다')
         self.assertEqual(paths[1].read_bytes(), b'v1.02base')
+        self.assertEqual(old_rom.read_bytes(), b'already patched rom')
+
+    def test_offline_reuse_does_not_remove_cached_patches(self):
+        _, download = self.release('v1.01')
+        with patch.object(app, 'download', download):
+            roles, _ = app.resolve_patch_roles(self.log)
+        cached = app.ensure_patch(roles[0], self.log)
+        self.assertTrue(cached.is_file())
+        self.latest.side_effect = urllib.error.URLError('offline')
+        self.resolve(Mock(side_effect=AssertionError('download offline')))
+        self.assertTrue(cached.is_file())
+
+    def test_legacy_patch_files_are_removed_with_new_version(self):
+        cache = app.cache_dir()
+        legacy = cache / 'YW3S_Korean_Patch_old.zip'
+        legacy.write_bytes(b'old archive')
+        (cache / 'patches').mkdir(parents=True, exist_ok=True)
+        old_delta = cache / 'patches' / 'YW3_Sukiyaki_KO_base_v1.01.xdelta'
+        old_delta.write_bytes(b'old patch')
+        _, download = self.release()
+        self.resolve(download)
+        self.assertFalse(legacy.exists())
+        self.assertFalse(old_delta.exists())
 
     def test_network_failure_reuses_verified_cache_with_notice(self):
         _, download = self.release()

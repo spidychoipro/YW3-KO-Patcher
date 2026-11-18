@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -134,6 +135,39 @@ def read_manifest(archive: Path, version: str) -> Bundle:
                           "구버전 패치를 대신 적용하지 않았습니다. 앱 업데이트를 확인해 주세요.") from exc
 
 
+def prune_older_cache(cache: Path, keep_version: str, log=None) -> list[Path]:
+    """새 패치가 확인됐을 때 앱 캐시의 구버전 패치 파일만 정리한다.
+
+    사용자가 이미 만든 패치 ROM, 원본 ROM, 작업 폴더는 여기서 건드리지 않는다.
+    오프라인 대비용으로 현재 버전 캐시는 남기고, 옵션 파일도 그대로 둔다.
+    """
+    removed: list[Path] = []
+    patches = cache / "patches"
+    releases = cache / "releases"
+
+    for folder in (releases, patches):
+        if not folder.is_dir():
+            continue
+        for entry in folder.iterdir():
+            if entry.is_dir() and entry.name != keep_version:
+                shutil.rmtree(entry, ignore_errors=True)
+                removed.append(entry)
+            elif folder == patches and entry.is_file() and entry.suffix == ".xdelta":
+                # 버전 폴더 생기기 전에 쓰던 평면 캐시.
+                entry.unlink(missing_ok=True)
+                removed.append(entry)
+
+    for entry in cache.glob("YW3S_Korean_Patch_*.zip"):
+        if entry.is_file():
+            entry.unlink(missing_ok=True)
+            removed.append(entry)
+
+    if removed and log is not None:
+        log(f"이전 한글 패치 캐시 {len(removed)}개를 정리했습니다. "
+            "이미 만든 패치 ROM과 원본 파일은 그대로 둡니다.")
+    return removed
+
+
 def fetch_latest() -> dict:
     request = urllib.request.Request(LATEST_URL, headers={
         "User-Agent": "YW3KoPatcher", "Accept": "application/vnd.github+json"})
@@ -207,6 +241,10 @@ def resolve(cache: Path, download, log, progress=None) -> tuple[Bundle | None, s
             archive.unlink(missing_ok=True)
             raise UpdateError("내려받은 공식 패키지의 크기 또는 SHA-256이 다릅니다")
     bundle = read_manifest(archive, version)
+    if not offline:
+        # 새 버전이 확인된 경우에만 정리한다. 오프라인 첫 실행의 기본 v1.01이나
+        # 저장된 버전으로 되돌아갈 때는 캐시를 남겨 둔다.
+        prune_older_cache(cache, version, log)
     label = (f"최신 확인 실패 · 저장된 한글 패치 {version} 사용" if offline
              else f"공식 최신 한글 패치 {version}")
     log(label)
