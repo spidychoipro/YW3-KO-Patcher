@@ -38,7 +38,7 @@ import yw3verify as container_verify
 import yw3external as external
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
