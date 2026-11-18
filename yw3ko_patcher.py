@@ -31,6 +31,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import yw3appupdate as appupdate
 import yw3convert as converter
 import yw3profile as profiles
 import yw3updates as updates
@@ -38,7 +39,7 @@ import yw3verify as container_verify
 import yw3external as external
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.7.0"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -1062,6 +1063,7 @@ class PatcherApp(tk.Tk):
         self._last_out_dir: Path | None = None
         self._entries: list[ttk.Entry] = []
         self._buttons: list[ttk.Button] = []
+        self._update_check_running = False
 
         self.option_add("*Font", ("Malgun Gothic", 10))
         style = ttk.Style(self)
@@ -1077,6 +1079,8 @@ class PatcherApp(tk.Tk):
         self._refresh()
         self._center_window()
         self.after(80, self._drain_queue)
+        if appupdate.can_self_update():
+            self.after(1500, self._startup_update_check)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------------------------------------------------------- UI
@@ -1132,6 +1136,9 @@ class PatcherApp(tk.Tk):
         self.log_button.pack(side="left")
         ttk.Button(actions, text="키 파일 안내", command=self._show_key_help).pack(
             side="left", padx=(8, 0))
+        self.update_button = ttk.Button(actions, text="업데이트 확인",
+                                        command=self._start_update_check)
+        self.update_button.pack(side="left", padx=(8, 0))
 
         self.log_frame = ttk.LabelFrame(outer, text=" 진행 기록 ", padding=(6, 4))
         self.log_frame.columnconfigure(0, weight=1)
@@ -1468,6 +1475,8 @@ class PatcherApp(tk.Tk):
                     self.status_var.set(event[1])
                 elif kind == "patch_version":
                     self.patch_version_var.set(event[1])
+                elif kind == "app_update":
+                    self._finish_update_check(event[1], event[2], event[3])
                 elif kind == "progress" and event[1] is not None:
                     self.progress["value"] = max(0.0, min(100.0, event[1]))
                 elif kind == "done":
@@ -1521,11 +1530,92 @@ class PatcherApp(tk.Tk):
         if folder and Path(folder).is_dir():
             os.startfile(folder)  # type: ignore[attr-defined]
 
+    # ------------------------------------------------------- 앱 업데이트
+    def _startup_update_check(self) -> None:
+        self._start_update_check(manual=False)
+
+    def _start_update_check(self, manual: bool = True) -> None:
+        if self._update_check_running or self._busy:
+            return
+        self._update_check_running = True
+        self.update_button.configure(state="disabled")
+        if manual:
+            self._status("앱 업데이트 확인 중...")
+        threading.Thread(target=self._worker_update_check, args=(manual,), daemon=True).start()
+
+    def _worker_update_check(self, manual: bool) -> None:
+        try:
+            release = appupdate.check(APP_VERSION)
+            self._emit("app_update", release, "", manual)
+        except Exception as exc:  # noqa: BLE001 - 확인 실패는 조용히 기록
+            self._emit("app_update", None, str(exc), manual)
+
+    def _finish_update_check(self, release, error: str, manual: bool) -> None:
+        self._update_check_running = False
+        self.update_button.configure(state="disabled" if self._busy else "normal")
+        if self._busy:
+            self._log("패치 작업 중이라 앱 업데이트 안내를 나중으로 미뤘습니다")
+            return
+        if error:
+            self._log(f"앱 업데이트 확인 실패: {error}")
+            if manual:
+                self._status("앱 업데이트 확인 실패")
+                messagebox.showerror("앱 업데이트 확인",
+                                     f"새 버전을 확인하지 못했습니다.\n{error}")
+            return
+        if release is None:
+            text = f"현재 버전이 최신입니다 (v{APP_VERSION})"
+            self._log(text)
+            if manual:
+                self._status(text)
+                messagebox.showinfo("앱 업데이트 확인", text)
+            return
+
+        self._log(f"새 앱 버전 {release.version} 확인: {release.page}")
+        self._status(f"새 앱 버전 {release.version} 있습니다")
+        if appupdate.can_self_update():
+            question = (f"새 버전 {release.version}이 있습니다. 지금 업데이트할까요?\n\n"
+                        "업데이트를 시작하면 앱이 종료되고 새 버전으로 다시 열립니다.")
+        else:
+            question = (f"새 버전 {release.version}이 있습니다. 업데이트 페이지를 열까요?\n\n"
+                        "소스에서 실행 중이라 자동 설치는 하지 않습니다.")
+        if not messagebox.askyesno("앱 업데이트", question):
+            self._log("앱 업데이트를 나중으로 미뤘습니다")
+            self._status(f"새 앱 버전 {release.version} · 나중에 설치 가능")
+            return
+        if not appupdate.can_self_update():
+            webbrowser.open(release.page)
+            self._log("업데이트 페이지를 열었습니다")
+            return
+        self._install_app_update(release)
+
+    def _install_app_update(self, release) -> None:
+        cache = cache_dir()
+        target = Path(sys.executable).resolve()
+        try:
+            self._status(f"앱 {release.version} 내려받는 중...")
+            source = appupdate.prepare_download(cache, release, download, self._log)
+            appupdate.launch_updater(
+                cache, target, source, release,
+                log_path=cache / "app-updates" / "updater.log")
+        except Exception as exc:  # noqa: BLE001 - 실패하면 직접 설치 안내
+            self._log(f"앱 업데이트 실패: {exc}")
+            self._status("앱 업데이트에 실패했습니다")
+            messagebox.showerror(
+                "앱 업데이트 실패",
+                f"새 버전을 설치하지 못했습니다.\n{exc}\n\n릴리스 페이지에서 직접 받을 수 있습니다.")
+            webbrowser.open(release.page)
+            return
+        self._log(f"앱을 종료하고 {release.version}을 설치합니다")
+        self.after(200, self.destroy)
+
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         state = "disabled" if busy else "normal"
-        for widget in (*self._entries, *self._buttons, self.log_button):
+        for widget in (*self._entries, *self._buttons, self.log_button, self.update_button):
             widget.configure(state=state)
+        if not busy and self._update_check_running:
+            self.update_button.configure(state="disabled")
         if busy:
             self.start_button.configure(state="disabled", text="한글 패치하는 중...")
         else:
