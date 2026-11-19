@@ -204,6 +204,7 @@ def test_gui_flow(exe: Path, work: Path) -> None:
         assert gui.progress["value"] == 100, gui.progress["value"]
         assert gui.patch_version_var.get() == "테스트 한글 패치", gui.patch_version_var.get()
         assert "완료" in gui.ready_var.get(), gui.ready_var.get()
+        assert "업데이트 CIA" in gui.ready_var.get(), "글자 깨짐 설치 안내가 없음"
         assert gui.open_button.winfo_manager() == "pack", "완료 후 폴더 열기 버튼이 없음"
         print(f"[ok] GUI 흐름 완료 (진행률 {gui.progress['value']:.0f}%)")
     finally:

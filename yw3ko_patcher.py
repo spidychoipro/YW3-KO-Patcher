@@ -39,7 +39,7 @@ import yw3verify as container_verify
 import yw3external as external
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.2"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -58,6 +58,14 @@ HASH_BLOCK = 8 * 1024 * 1024
 
 KEY_DUMP_URL = "https://citra-emu.com/wiki/aes-keys/"
 GODMODE9_URL = "https://3ds.hacks.guide/godmode9-usage.html"
+
+INSTALL_NOTICE = (
+    "글자가 안 보이거나 깨지면 생성한 업데이트 CIA를 먼저 설치했는지 확인하세요. "
+    "본편 CCI만 실행하면 번역이 빠집니다. "
+    "Azahar에서는 OpenGL 렌더러와 별도 사용자 폴더를 쓰고, "
+    "LayeredFS·code.ips·아이콘 override가 겹치면 안 됩니다. "
+    "전자 설명서는 일본어가 남고 일부 이미지의 일본어도 그대로일 수 있습니다."
+)
 
 KEY_HELP_TEXT = """암호화 CIA는 키 파일이 없으면 자동 복호화 도구로 먼저 처리합니다.
 처음에는 인터넷 연결이 필요하며 도구는 제작자 저장소에서 내려받아 검증합니다.
@@ -1490,7 +1498,9 @@ class PatcherApp(tk.Tk):
                             "완료! 한글 패치된 롬이 만들어졌어요.\n"
                             + "\n".join(f"· {path.name} ({human_size(path.stat().st_size)})"
                                         for path in results)
+                            + "\n" + INSTALL_NOTICE
                         )
+                        self._append_log(INSTALL_NOTICE)
                         self._set_ready(text + ("\n" + "\n".join(notes) if notes else ""),
                                         "Warn.TLabel" if notes else "Ok.TLabel", True)
                         self.open_button.pack(side="left", padx=(0, 8), before=self.log_button)
