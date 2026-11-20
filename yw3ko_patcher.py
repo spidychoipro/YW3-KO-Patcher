@@ -39,7 +39,7 @@ import yw3verify as container_verify
 import yw3external as external
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.7.3"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -64,6 +64,9 @@ INSTALL_NOTICE = (
     "본편 CCI만 실행하면 번역이 빠집니다. "
     "Azahar에서는 OpenGL 렌더러와 별도 사용자 폴더를 쓰고, "
     "LayeredFS·code.ips·아이콘 override가 겹치면 안 됩니다. "
+    "한글이 네모·물음표로 나오면 에뮬 시스템 폰트 문제입니다. Azahar는 한글 글리프가 없는 "
+    "공개 폰트를 쓰므로, 실제 3DS에서 시스템 아카이브와 공유 폰트를 덤프해 "
+    "사용자 폴더의 nand·sysdata에 넣어 주세요. "
     "전자 설명서는 일본어가 남고 일부 이미지의 일본어도 그대로일 수 있습니다."
 )
 
