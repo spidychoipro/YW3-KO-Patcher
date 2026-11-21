@@ -1792,6 +1792,21 @@ def cci_to_cia(src: Path, dst: Path, log, progress=None) -> Path:
             raise ConvertError("암호화된 CCI는 CIA로 바로 바꿀 수 없습니다. "
                                "먼저 복호화된 CCI를 만들어 주세요.")
 
+    # GodMode9 BuildInstallFromNcsdFile / BuildCiaMeta use the main SCI.
+    # A zero save size in the template must not suppress the game's save archive.
+    save_size = 0
+    dependencies = bytes(0x180)
+    if int.from_bytes(parts[0].header[0x180:0x184], "little"):
+        with src.open("rb") as source:
+            source.seek(parts[0].offset + 0x200)
+            sci = source.read(0x400)
+        if len(sci) != 0x400 or parts[0].size < 0x600:
+            raise ConvertError("본편의 확장 헤더가 잘렸습니다.")
+        save_size = int.from_bytes(sci[0x1C0:0x1C8], "little")
+        if save_size > 0xFFFFFFFF:
+            raise ConvertError("본편의 세이브 크기가 CIA 지원 범위를 넘습니다.")
+        dependencies = sci[0x40:0x1C0]
+
     count = len(parts)
     tmd_sig = _sig_data_size(int.from_bytes(ciatemplate.TMD[0:4], "big"))
     tmd_fixed = tmd_sig + 0xC4
@@ -1811,6 +1826,7 @@ def cci_to_cia(src: Path, dst: Path, log, progress=None) -> Path:
     ticket[ticket_sig + 0x9C:ticket_sig + 0xA4] = title_id.to_bytes(8, "big")
     ticket[ticket_sig + 0xA6:ticket_sig + 0xA8] = (0).to_bytes(2, "big")
     tmd[tmd_sig + 0x4C:tmd_sig + 0x54] = title_id.to_bytes(8, "big")
+    tmd[tmd_sig + 0x5A:tmd_sig + 0x5E] = save_size.to_bytes(4, "little")
     tmd[tmd_sig + 0x9C:tmd_sig + 0x9E] = (0).to_bytes(2, "big")
     tmd[tmd_sig + 0x9E:tmd_sig + 0xA0] = count.to_bytes(2, "big")
 
@@ -1840,6 +1856,8 @@ def cci_to_cia(src: Path, dst: Path, log, progress=None) -> Path:
     with src.open("rb") as source:
         smdh = _plain_ncch_smdh(source, parts[0])
     meta = bytearray(CIA_META_SIZE)
+    meta[:0x180] = dependencies
+    meta[0x300:0x304] = (2).to_bytes(4, "little")
     if smdh:
         meta[0x400:0x400 + len(smdh)] = smdh
     try:
@@ -1889,9 +1907,12 @@ def cci_to_cia(src: Path, dst: Path, log, progress=None) -> Path:
             info_record = bytearray(0x24)
             info_record[2:4] = count.to_bytes(2, "big")
             info_record[4:36] = hashlib.sha256(records).digest()
+            tmd[tmd_fixed:tmd_fixed + info_records] = bytes(info_records)
             tmd[tmd_fixed:tmd_fixed + 0x24] = info_record
             records_offset = tmd_fixed + info_records
             tmd[records_offset:records_offset + len(records)] = records
+            tmd[tmd_sig + 0xA4:tmd_sig + 0xC4] = hashlib.sha256(
+                tmd[tmd_fixed:tmd_fixed + info_records]).digest()
             target.seek(tmd_position)
             target.write(tmd)
     except Exception:
