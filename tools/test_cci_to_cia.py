@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import yw3convert as converter  # noqa: E402
+import yw3external as external  # noqa: E402
 
 
 def fake_ncch(title_id: int) -> bytes:
@@ -58,6 +59,27 @@ class CciToCiaTest(unittest.TestCase):
                     record = records[item.index * 0x30:(item.index + 1) * 0x30]
                     self.assertEqual(hashlib.sha256(raw).digest(), record[16:48])
                     self.assertEqual(int.from_bytes(record[8:16], "big"), item.size)
+
+
+    def test_locked_destination_uses_alternate_name(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            head = fake_ncch(0x00040000001AF400)
+            header = converter._build_ncsd_header([(head, len(head))])
+            cci = root / "test.cci"
+            cia = root / "test.cia"
+            with cci.open("wb") as handle:
+                handle.write(header)
+                handle.write(head)
+            cia.write_bytes(b"old locked file")
+
+            with external.protect_source(cia):
+                created = converter.cci_to_cia(cci, cia, lambda _message: None)
+
+            self.assertEqual(created.name, "test_2.cia")
+            self.assertTrue(created.is_file())
+            self.assertEqual(cia.read_bytes(), b"old locked file")
+            self.assertFalse((root / "test.cia.part").exists())
 
 
 if __name__ == "__main__":

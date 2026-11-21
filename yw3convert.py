@@ -1860,14 +1860,38 @@ def cci_to_cia(src: Path, dst: Path, log, progress=None) -> Path:
     except Exception:
         part_path.unlink(missing_ok=True)
         raise
-    os.replace(part_path, dst)
 
-    info = read_cia(dst)
+    final_path = dst
+    try:
+        os.replace(part_path, final_path)
+    except OSError as exc:
+        # 에뮬레이터가 예전 CIA를 열어 두면 Windows가 덮어쓰기를 거부한다.
+        if not isinstance(exc, PermissionError) and getattr(exc, "winerror", None) not in (5, 32):
+            part_path.unlink(missing_ok=True)
+            raise
+        number = 2
+        while number <= 99:
+            final_path = dst.with_name(f"{dst.stem}_{number}{dst.suffix}")
+            if not final_path.exists():
+                try:
+                    os.replace(part_path, final_path)
+                    break
+                except OSError:
+                    pass
+            number += 1
+        else:
+            part_path.unlink(missing_ok=True)
+            raise ConvertError(
+                "기존 CIA 파일이 열려 있어 덮어쓸 수 없습니다. "
+                "Azahar를 닫고 다시 시도해 주세요.") from exc
+        log(f"기존 CIA가 열려 있어 {final_path.name}로 저장했습니다.")
+
+    info = read_cia(final_path)
     if (info.title_id != title_id or len(info.contents) != count or info.needs_key
             or info.content_area != content_offset):
         raise ConvertError("만든 CIA를 다시 읽어 확인하지 못했습니다. 파일을 지우고 다시 시도해 주세요.")
-    log(f"CIA 변환 완료: {dst.name} ({_size_text(dst.stat().st_size)})")
-    return dst
+    log(f"CIA 변환 완료: {final_path.name} ({_size_text(final_path.stat().st_size)})")
+    return final_path
 
 
 def ncch_to_cci(src: Path, dst: Path, log, progress=None) -> Path:
