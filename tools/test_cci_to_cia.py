@@ -61,6 +61,43 @@ class CciToCiaTest(unittest.TestCase):
                     self.assertEqual(int.from_bytes(record[8:16], "big"), item.size)
 
 
+    def test_cia_carries_smdh_meta_for_home_menu(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base_title = 0x00040000001AF400
+            smdh = bytes(range(0x100)) * 0x36  # 0x3600 bytes, 잘라서 넣는다
+            smdh = smdh[:0x36C0]
+            head = bytearray(fake_ncch(base_title))
+            exefs_offset = 0x200
+            exefs_size = converter._align(0x200 + len(smdh), 0x200)
+            head[0x1A0:0x1A4] = (exefs_offset // 0x200).to_bytes(4, "little")
+            head[0x1A4:0x1A8] = (exefs_size // 0x200).to_bytes(4, "little")
+            table = bytearray(0x200)
+            table[0:8] = b"icon\x00\x00\x00\x00"
+            table[8:12] = (0).to_bytes(4, "little")
+            table[12:16] = len(smdh).to_bytes(4, "little")
+            part = bytes(head) + bytes(table) + smdh
+            part += b"\x00" * (exefs_size + exefs_offset - len(part))
+
+            header = converter._build_ncsd_header([(bytes(head), len(part))])
+            cci = root / "test.cci"
+            cia = root / "test.cia"
+            with cci.open("wb") as handle:
+                handle.write(header)
+                handle.write(part)
+            converter.cci_to_cia(cci, cia, lambda _message: None)
+
+            with cia.open("rb") as handle:
+                cia_header = handle.read(converter.CIA_HEADER_SIZE)
+                info = converter.read_cia(cia)
+                handle.seek(info.content_area + info.contents[-1].size)
+                handle.seek((handle.tell() + 0x3F) & ~0x3F)
+                meta = handle.read(converter.CIA_META_SIZE)
+            self.assertEqual(int.from_bytes(cia_header[0x14:0x18], "little"),
+                             converter.CIA_META_SIZE)
+            self.assertEqual(meta[0x400:0x400 + len(smdh)], smdh)
+
+
     def test_locked_destination_uses_alternate_name(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

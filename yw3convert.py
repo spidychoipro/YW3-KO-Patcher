@@ -32,6 +32,7 @@ import yw3ciatemplate as ciatemplate
 MEDIA_UNIT = 0x200
 CCI_HEADER_SIZE = 0x4000  # NCSD 헤더 + 카드 정보 헤더 영역
 CIA_HEADER_SIZE = 0x2020  # CIA 헤더(뒤 예약 영역 포함)
+CIA_META_SIZE = 0x3AC0  # CIA 메타(SMDH 포함). 홈메뉴가 아이콘을 읽으려면 필요하다.
 CHUNK = 8 * 1024 * 1024
 
 SIG_SIZES = {
@@ -1746,6 +1747,32 @@ def cia_to_cci(src: Path, dst: Path, keys: Keys, log, progress=None,
     return dst
 
 
+def _plain_ncch_smdh(handle, part: NcchPartition) -> bytes:
+    """복호화된 NCCH의 ExeFS에서 icon(SMDH)을 읽는다."""
+    header = part.header
+    unit = ncch_unit(header)
+    exefs_offset = int.from_bytes(header[0x1A0:0x1A4], "little") * unit
+    exefs_size = int.from_bytes(header[0x1A4:0x1A8], "little") * unit
+    if not exefs_offset or not exefs_size:
+        return b""
+    handle.seek(part.offset + exefs_offset)
+    table = handle.read(0x200)
+    if len(table) < 0x200:
+        return b""
+    for index in range(10):
+        entry = table[index * 0x10:(index + 1) * 0x10]
+        if entry[:8].rstrip(b"\x00") != b"icon":
+            continue
+        file_offset = int.from_bytes(entry[8:12], "little")
+        file_size = int.from_bytes(entry[12:16], "little")
+        start = exefs_offset + 0x200 + file_offset
+        if start >= exefs_offset + exefs_size or not file_size:
+            return b""
+        handle.seek(part.offset + start)
+        return handle.read(min(file_size, 0x36C0, exefs_offset + exefs_size - start))
+    return b""
+
+
 def cci_to_cia(src: Path, dst: Path, log, progress=None) -> Path:
     """복호화된 CCI를 실기에서 설치할 수 있는 CIA로 바꾼다.
 
@@ -1794,6 +1821,7 @@ def cci_to_cia(src: Path, dst: Path, log, progress=None) -> Path:
     header[8:12] = len(cert).to_bytes(4, "little")
     header[12:16] = len(ticket).to_bytes(4, "little")
     header[16:20] = len(tmd).to_bytes(4, "little")
+    header[20:24] = CIA_META_SIZE.to_bytes(4, "little")
     header[24:32] = content_size.to_bytes(8, "little")
     # content present 비트: index 0이 각 바이트의 MSB다. 이걸 안 켜면
     # Azahar가 설치는 성공으로 처리하고 실제 콘텐츠를 하나도 넣지 않는다.
@@ -1809,6 +1837,11 @@ def cci_to_cia(src: Path, dst: Path, log, progress=None) -> Path:
     part_path = dst.with_name(dst.name + ".part")
     part_path.unlink(missing_ok=True)
     hashes: list[bytes] = []
+    with src.open("rb") as source:
+        smdh = _plain_ncch_smdh(source, parts[0])
+    meta = bytearray(CIA_META_SIZE)
+    if smdh:
+        meta[0x400:0x400 + len(smdh)] = smdh
     try:
         with src.open("rb") as source, part_path.open("wb") as target:
             target.write(header)
@@ -1839,6 +1872,10 @@ def cci_to_cia(src: Path, dst: Path, log, progress=None) -> Path:
                 done += size
                 if progress:
                     progress(min(99.0, 100.0 * done / max(content_size, 1)))
+
+            meta_offset = _align(content_offset + content_size, 0x40)
+            target.write(b"\x00" * (meta_offset - target.tell()))
+            target.write(meta)
 
             records = bytearray()
             for index, (ncch, digest) in enumerate(zip(parts, hashes)):
