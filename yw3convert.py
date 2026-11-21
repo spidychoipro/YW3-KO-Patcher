@@ -5,6 +5,7 @@
 - 암호화된 CIA의 내용을 복호화한다 (티켓의 타이틀 키 사용).
 - 암호화된 CCI(NCSD)의 NCCH 구간을 복호화한다 (NCCH 표준 암호).
 - CIA(또는 NCCH)를 CCI로 다시 묶는다.
+- 복호화된 CCI를 실기에서 설치할 수 있는 CIA로 바꾼다.
 - 파일 헤더를 읽어 컨테이너 구조를 파악한다.
 
 AES는 Windows CNG(bcrypt.dll)를 그대로 쓴다. 외부 패키지가 없어도 되고
@@ -26,8 +27,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from ctypes import wintypes
 
+import yw3ciatemplate as ciatemplate
+
 MEDIA_UNIT = 0x200
 CCI_HEADER_SIZE = 0x4000  # NCSD 헤더 + 카드 정보 헤더 영역
+CIA_HEADER_SIZE = 0x2020  # CIA 헤더(뒤 예약 영역 포함)
 CHUNK = 8 * 1024 * 1024
 
 SIG_SIZES = {
@@ -1739,6 +1743,126 @@ def cia_to_cci(src: Path, dst: Path, keys: Keys, log, progress=None,
             raise
         os.replace(part, dst)
     log(f"CCI 변환 완료: {dst.name} ({_size_text(dst.stat().st_size)})")
+    return dst
+
+
+def cci_to_cia(src: Path, dst: Path, log, progress=None) -> Path:
+    """복호화된 CCI를 실기에서 설치할 수 있는 CIA로 바꾼다.
+
+    makerom은 CCI 전체를 메모리에 올려서 3GB가 넘는 본편을 처리하지 못한다.
+    여기서는 CIA의 머리 부분(인증서·티켓·TMD)만 고정 서식으로 만들어 쓰고
+    NCCH 파티션은 스트리밍으로 복사한다. 내용은 이미 평문이므로 암호화하지
+    않고, TMD에 각 파티션의 크기와 SHA-256만 남긴다.
+    """
+    parts = read_ncsd(src)
+    if not parts:
+        raise ConvertError("CCI 안에 NCCH 파티션이 없습니다.")
+    title_id = int.from_bytes(parts[0].header[0x118:0x120], "little")
+    if title_id != 0x00040000001AF400:
+        raise ConvertError("본편 CCI가 아닙니다. 요괴워치3 스키야키 본편 CCI를 골라 주세요.")
+    for part in parts:
+        if not part.header[0x18F] & 0x04:
+            raise ConvertError("암호화된 CCI는 CIA로 바로 바꿀 수 없습니다. "
+                               "먼저 복호화된 CCI를 만들어 주세요.")
+
+    count = len(parts)
+    tmd_sig = _sig_data_size(int.from_bytes(ciatemplate.TMD[0:4], "big"))
+    tmd_fixed = tmd_sig + 0xC4
+    info_records = 64 * 0x24
+    tmd_size = tmd_fixed + info_records + count * 0x30
+    ticket_sig = _sig_data_size(int.from_bytes(ciatemplate.TICKET[0:4], "big"))
+
+    cert = bytearray(ciatemplate.CERT_CHAIN)
+    ticket = bytearray(ciatemplate.TICKET)
+    tmd = bytearray(ciatemplate.TMD)
+    if len(tmd) < tmd_size:
+        tmd.extend(b"\x00" * (tmd_size - len(tmd)))
+    else:
+        del tmd[tmd_size:]
+
+    ticket[ticket_sig + 0x7F:ticket_sig + 0x8F] = b"\x00" * 16
+    ticket[ticket_sig + 0x9C:ticket_sig + 0xA4] = title_id.to_bytes(8, "big")
+    ticket[ticket_sig + 0xA6:ticket_sig + 0xA8] = (0).to_bytes(2, "big")
+    tmd[tmd_sig + 0x4C:tmd_sig + 0x54] = title_id.to_bytes(8, "big")
+    tmd[tmd_sig + 0x9C:tmd_sig + 0x9E] = (0).to_bytes(2, "big")
+    tmd[tmd_sig + 0x9E:tmd_sig + 0xA0] = count.to_bytes(2, "big")
+
+    sizes = [_align(part.size, 0x40) for part in parts]
+    content_size = sum(sizes)
+    header = bytearray(CIA_HEADER_SIZE)
+    header[0:4] = (CIA_HEADER_SIZE).to_bytes(4, "little")
+    header[8:12] = len(cert).to_bytes(4, "little")
+    header[12:16] = len(ticket).to_bytes(4, "little")
+    header[16:20] = len(tmd).to_bytes(4, "little")
+    header[24:32] = content_size.to_bytes(8, "little")
+    cert_offset = _align(CIA_HEADER_SIZE, 0x40)
+    ticket_offset = _align(cert_offset + len(cert), 0x40)
+    tmd_offset = _align(ticket_offset + len(ticket), 0x40)
+    content_offset = _align(tmd_offset + len(tmd), 0x40)
+
+    log(f"CCI 파티션 {count}개를 실기용 CIA로 묶습니다.")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    part_path = dst.with_name(dst.name + ".part")
+    part_path.unlink(missing_ok=True)
+    hashes: list[bytes] = []
+    try:
+        with src.open("rb") as source, part_path.open("wb") as target:
+            target.write(header)
+            target.write(b"\x00" * (cert_offset - target.tell()))
+            target.write(cert)
+            target.write(b"\x00" * (ticket_offset - target.tell()))
+            target.write(ticket)
+            target.write(b"\x00" * (tmd_offset - target.tell()))
+            tmd_position = target.tell()
+            target.write(tmd)
+            target.write(b"\x00" * (content_offset - target.tell()))
+
+            done = 0
+            for ncch, size in zip(parts, sizes):
+                source.seek(ncch.offset)
+                digest = hashlib.sha256()
+                left = ncch.size
+                while left:
+                    block = source.read(min(CHUNK, left))
+                    if not block:
+                        raise ConvertError("CCI를 읽는 도중에 끝났습니다. 파일이 손상됐을 수 있어요.")
+                    digest.update(block)
+                    target.write(block)
+                    left -= len(block)
+                if size > ncch.size:
+                    target.write(b"\x00" * (size - ncch.size))
+                hashes.append(digest.digest())
+                done += size
+                if progress:
+                    progress(min(99.0, 100.0 * done / max(content_size, 1)))
+
+            records = bytearray()
+            for index, (ncch, digest) in enumerate(zip(parts, hashes)):
+                record = bytearray(0x30)
+                record[0:4] = index.to_bytes(4, "big")
+                record[4:6] = ncch.index.to_bytes(2, "big")
+                record[6:8] = (0).to_bytes(2, "big")
+                record[8:16] = ncch.size.to_bytes(8, "big")
+                record[16:48] = digest
+                records.extend(record)
+            info_record = bytearray(0x24)
+            info_record[2:4] = count.to_bytes(2, "big")
+            info_record[4:36] = hashlib.sha256(records).digest()
+            tmd[tmd_fixed:tmd_fixed + 0x24] = info_record
+            records_offset = tmd_fixed + info_records
+            tmd[records_offset:records_offset + len(records)] = records
+            target.seek(tmd_position)
+            target.write(tmd)
+    except Exception:
+        part_path.unlink(missing_ok=True)
+        raise
+    os.replace(part_path, dst)
+
+    info = read_cia(dst)
+    if (info.title_id != title_id or len(info.contents) != count or info.needs_key
+            or info.content_area != content_offset):
+        raise ConvertError("만든 CIA를 다시 읽어 확인하지 못했습니다. 파일을 지우고 다시 시도해 주세요.")
+    log(f"CIA 변환 완료: {dst.name} ({_size_text(dst.stat().st_size)})")
     return dst
 
 
