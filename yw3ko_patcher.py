@@ -39,7 +39,7 @@ import yw3verify as container_verify
 import yw3external as external
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.7.5"
+APP_VERSION = "1.7.6"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -1252,8 +1252,8 @@ class PatcherApp(tk.Tk):
     def _worker_cci_convert(self, source: Path, target: Path) -> None:
         try:
             self._status("CCI를 CIA로 바꾸는 중...")
-            converter.cci_to_cia(source, target, self._log, self._progress)
-            self._emit("cci_done", True, target)
+            created = converter.cci_to_cia(source, target, self._log, self._progress)
+            self._emit("cci_done", True, created)
         except (converter.ConvertError, OSError) as exc:
             self._log(f"오류: {exc}")
             self._emit("cci_done", False, str(exc))
@@ -1523,10 +1523,10 @@ class PatcherApp(tk.Tk):
                 base_cci = results[0]
                 base_cia = base_cci.with_suffix(".cia")
                 self._status("실기용 CIA 만들기...")
-                converter.cci_to_cia(
+                created_cia = converter.cci_to_cia(
                     base_cci, base_cia, self._log,
                     lambda value: self._progress(96.0 + 4.0 * value / 100.0))
-                results.append(base_cia)
+                results.append(created_cia)
                 notes.append("본편 CIA도 같이 만들었습니다. 실기에서는 이 파일과 업데이트 CIA를 설치하세요.")
             self._status("마무리 확인 중...")
             self._emit("done", True, results, out_dir, notes)
