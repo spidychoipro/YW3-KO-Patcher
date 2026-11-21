@@ -43,6 +43,12 @@ class CciToCiaTest(unittest.TestCase):
             self.assertEqual(len(info.contents), 2)
             self.assertEqual([item.index for item in info.contents], [0, 1])
 
+            with cia.open("rb") as handle:
+                header = handle.read(converter.CIA_HEADER_SIZE)
+            self.assertEqual(header[0x20] & 0xC0, 0xC0)  # content 0, 1 present
+            ticket_sig = converter._sig_data_size(int.from_bytes(info.ticket[0:4], "big"))
+            self.assertTrue(any(info.ticket[ticket_sig + 0x7F:ticket_sig + 0x8F]))
+
             sig = converter._sig_data_size(int.from_bytes(info.tmd[0:4], "big"))
             records = info.tmd[sig + 0xC4 + 64 * 0x24:]
             with cia.open("rb") as handle:

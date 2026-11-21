@@ -1780,7 +1780,7 @@ def cci_to_cia(src: Path, dst: Path, log, progress=None) -> Path:
     else:
         del tmd[tmd_size:]
 
-    ticket[ticket_sig + 0x7F:ticket_sig + 0x8F] = b"\x00" * 16
+    # 평문 콘텐츠여도 티켓 타이틀 키는 0이면 안 된다. Azahar/FBI가 세이브 키 등에 쓴다.
     ticket[ticket_sig + 0x9C:ticket_sig + 0xA4] = title_id.to_bytes(8, "big")
     ticket[ticket_sig + 0xA6:ticket_sig + 0xA8] = (0).to_bytes(2, "big")
     tmd[tmd_sig + 0x4C:tmd_sig + 0x54] = title_id.to_bytes(8, "big")
@@ -1795,6 +1795,10 @@ def cci_to_cia(src: Path, dst: Path, log, progress=None) -> Path:
     header[12:16] = len(ticket).to_bytes(4, "little")
     header[16:20] = len(tmd).to_bytes(4, "little")
     header[24:32] = content_size.to_bytes(8, "little")
+    # content present 비트: index 0이 각 바이트의 MSB다. 이걸 안 켜면
+    # Azahar가 설치는 성공으로 처리하고 실제 콘텐츠를 하나도 넣지 않는다.
+    for ncch in parts:
+        header[0x20 + (ncch.index >> 3)] |= 0x80 >> (ncch.index & 7)
     cert_offset = _align(CIA_HEADER_SIZE, 0x40)
     ticket_offset = _align(cert_offset + len(cert), 0x40)
     tmd_offset = _align(ticket_offset + len(ticket), 0x40)
