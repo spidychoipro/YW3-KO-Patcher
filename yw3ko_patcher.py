@@ -39,7 +39,7 @@ import yw3verify as container_verify
 import yw3external as external
 
 APP_NAME = "요괴워치3 스키야키 한국어 패치 적용기"
-APP_VERSION = "1.7.3"
+APP_VERSION = "1.7.4"
 CACHE_ENV = "YW3KO_CACHE"
 
 REPO = "TeamLimRyan/YW3_SUKIYAKI_KOREAN_LOCALIZATION_RELEASE"
@@ -60,8 +60,14 @@ KEY_DUMP_URL = "https://citra-emu.com/wiki/aes-keys/"
 GODMODE9_URL = "https://3ds.hacks.guide/godmode9-usage.html"
 
 INSTALL_NOTICE = (
-    "글자가 안 보이거나 깨지면 생성한 업데이트 CIA를 먼저 설치했는지 확인하세요. "
-    "본편 CCI만 실행하면 번역이 빠집니다. "
+    "실기(3DS 본체)용으로 패치 결과의 base.cci를 base.cia로도 같이 만들었습니다. "
+    "이미 예전 버전에서 받아 둔 base.cci가 있다면 '기존 CCI → CIA' 칸에서 그 파일을 고르고 "
+    "CIA로 변환을 누르면 됩니다. 다시 패치할 필요 없어요. "
+    "FBI로 본편 CIA와 업데이트 CIA를 설치하세요. 본편이 이미 설치돼 있으면 "
+    "FBI에서 기존 본편을 먼저 지우고 설치해야 합니다. "
+    "Azahar에서는 업데이트 CIA를 먼저 설치하고 본편 CCI를 바로 실행합니다. "
+    "글자가 안 보이거나 깨지면 업데이트 CIA가 들어갔는지 먼저 확인하세요. "
+    "본편만 실행하면 번역이 빠집니다. "
     "Azahar에서는 OpenGL 렌더러와 별도 사용자 폴더를 쓰고, "
     "LayeredFS·code.ips·아이콘 override가 겹치면 안 됩니다. "
     "한글이 네모·물음표로 나오면 에뮬 시스템 폰트 문제입니다. Azahar는 한글 글리프가 없는 "
@@ -1116,14 +1122,20 @@ class PatcherApp(tk.Tk):
         self.update_var = tk.StringVar()
         self.out_var = tk.StringVar()
         self.keys_var = tk.StringVar()
+        self.cci_var = tk.StringVar()
         self.ready_var = tk.StringVar(value="본편 롬과 업데이트 파일을 골라 주세요.")
         self._add_file_row(files, 0, "① 본편 롬", self.base_var, self._pick_base)
         self._add_file_row(files, 1, "② 업데이트 파일", self.update_var, self._pick_update)
         self._add_file_row(files, 2, "③ 저장 위치", self.out_var, self._pick_out, folder=True)
         self._add_file_row(files, 3, "키 파일 (선택)", self.keys_var, self._pick_keys)
+        self._add_file_row(files, 4, "기존 CCI → CIA", self.cci_var, self._pick_cci)
+        self.cci_button = ttk.Button(files, text="CIA로 변환", command=self._start_cci_convert,
+                                     width=12)
+        self.cci_button.grid(row=4, column=3, sticky="w", padx=(6, 0), pady=4)
+        self._buttons.append(self.cci_button)
         self.patch_version_var = tk.StringVar(value="한글 패치: 시작 시 공식 최신 버전 확인")
         ttk.Label(files, textvariable=self.patch_version_var, style="Hint.TLabel",
-                  wraplength=700).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+                  wraplength=700).grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
         self.ready_label = ttk.Label(outer, textvariable=self.ready_var, style="Hint.TLabel",
                                      wraplength=760, justify="left")
         self.ready_label.grid(row=3, column=0, sticky="w", pady=(12, 0))
@@ -1165,7 +1177,8 @@ class PatcherApp(tk.Tk):
 
         ttk.Label(
             outer,
-            text="원본 파일은 그대로 두고 새 파일로 만들어요. 패치 파일은 제작팀 공식 배포처에서만 받습니다.",
+            text="원본 파일은 그대로 두고 새 파일로 만들어요. 패치 파일은 제작팀 공식 배포처에서만 받고, "
+                 "기존 CCI → CIA는 패치 없이 바로 변환합니다.",
             style="Hint.TLabel",
             wraplength=780,
         ).grid(row=10, column=0, sticky="w", pady=(10, 0))
@@ -1189,6 +1202,66 @@ class PatcherApp(tk.Tk):
         path = self._ask_file("업데이트 파일 선택")
         if path:
             self.update_var.set(path)
+
+    def _pick_cci(self) -> None:
+        path = filedialog.askopenfilename(
+            title="이미 만든 본편 CCI 선택",
+            filetypes=[("본편 CCI", "*.cci *.3ds"), ("모든 파일", "*.*")],
+        )
+        if path:
+            self.cci_var.set(path)
+
+    def _start_cci_convert(self) -> None:
+        if self._busy:
+            return
+        text = self.cci_var.get().strip().strip('"')
+        source = Path(text) if text else None
+        if source is None or not source.is_file():
+            messagebox.showwarning("CCI 선택", "변환할 본편 CCI를 먼저 골라 주세요.")
+            return
+        info = inspect_rom(source)
+        if info.kind != "cci":
+            messagebox.showerror("CCI 변환", "CCI 파일이 아닙니다. 본편 CCI를 골라 주세요.")
+            return
+        if info.encrypted:
+            messagebox.showerror(
+                "CCI 변환", "암호화된 CCI는 바로 변환할 수 없습니다. "
+                "앱으로 패치해 복호화된 CCI를 만든 뒤 다시 시도해 주세요.")
+            return
+        target = source.with_suffix(".cia")
+        if target.exists() and not messagebox.askyesno(
+                "CCI 변환", f"이미 파일이 있어요.\n{target.name}\n덮어쓸까요?"):
+            return
+        needed = source.stat().st_size + 128 * 1024 * 1024
+        free = shutil.disk_usage(source.parent).free
+        if free < needed:
+            messagebox.showerror(
+                "CCI 변환", f"저장 공간이 부족합니다. 필요 약 {human_size(needed)}, "
+                f"남은 공간 {human_size(free)}.")
+            return
+        self._clear_log()
+        self._log(f"CCI 변환: {source}")
+        self._log(f"결과: {target}")
+        self.progress["value"] = 0
+        self._set_ready("CCI를 CIA로 바꾸는 중...", "Hint.TLabel", False)
+        self._set_busy(True)
+        self.start_button.configure(text="CCI 변환 중...")
+        threading.Thread(target=self._worker_cci_convert, args=(source, target),
+                         daemon=True).start()
+
+    def _worker_cci_convert(self, source: Path, target: Path) -> None:
+        try:
+            self._status("CCI를 CIA로 바꾸는 중...")
+            converter.cci_to_cia(source, target, self._log, self._progress)
+            self._emit("cci_done", True, target)
+        except (converter.ConvertError, OSError) as exc:
+            self._log(f"오류: {exc}")
+            self._emit("cci_done", False, str(exc))
+        except Exception as exc:  # noqa: BLE001 - UI로 넘길 마지막 안전망
+            self._log(f"예기치 않은 오류: {exc!r}")
+            self._emit("cci_done", False, f"예기치 않은 오류가 났습니다.\n{exc}")
+        finally:
+            self._emit("busy", False)
 
     def _ask_file(self, title: str) -> str:
         path = filedialog.askopenfilename(
@@ -1364,7 +1437,8 @@ class PatcherApp(tk.Tk):
             self._set_ready(f"저장 위치를 만들 수 없어요: {exc}", "Warn.TLabel", False)
             return
 
-        needed = sum(role.result_size for role in ROLES) + 256 * 1024 * 1024
+        needed = (sum(role.result_size for role in ROLES) + BASE.result_size
+                  + 256 * 1024 * 1024)  # 본편 CIA도 같이 만든다
         for path in (base, update):
             info = inspect_rom(path)
             if info.kind == "cia" or (path == base and info.kind == "ncch"):
@@ -1445,10 +1519,22 @@ class PatcherApp(tk.Tk):
                     notes.append(
                         f"{role.label}: 원본이 공식 CCI가 아니라 헤더가 조금 달라요. "
                         "게임 내용은 확인했으니 그대로 쓰면 됩니다.")
+            if results and results[0].suffix.lower() in (".cci", ".3ds"):
+                base_cci = results[0]
+                base_cia = base_cci.with_suffix(".cia")
+                self._status("실기용 CIA 만들기...")
+                converter.cci_to_cia(
+                    base_cci, base_cia, self._log,
+                    lambda value: self._progress(96.0 + 4.0 * value / 100.0))
+                results.append(base_cia)
+                notes.append("본편 CIA도 같이 만들었습니다. 실기에서는 이 파일과 업데이트 CIA를 설치하세요.")
             self._status("마무리 확인 중...")
             self._emit("done", True, results, out_dir, notes)
         except PatchError as exc:
             self._emit("patch_version", "한글 패치 준비 실패 · 진행 기록을 확인해 주세요")
+            self._log(f"오류: {exc}")
+            self._emit("done", False, str(exc))
+        except converter.ConvertError as exc:
             self._log(f"오류: {exc}")
             self._emit("done", False, str(exc))
         except Exception as exc:  # noqa: BLE001 - UI로 넘길 마지막 안전망
@@ -1490,6 +1576,21 @@ class PatcherApp(tk.Tk):
                     self._finish_update_check(event[1], event[2], event[3])
                 elif kind == "progress" and event[1] is not None:
                     self.progress["value"] = max(0.0, min(100.0, event[1]))
+                elif kind == "cci_done":
+                    if event[1]:
+                        target = event[2]
+                        self.progress["value"] = 100
+                        self.status_var.set(f"저장 위치: {target.parent}")
+                        text = (f"완료! 실기에서 설치할 CIA를 만들었어요.\n"
+                                f"· {target.name} ({human_size(target.stat().st_size)})\n"
+                                "FBI로 이 파일과 업데이트 CIA를 설치하세요. "
+                                "기존 본편이 있으면 먼저 지우고 설치해야 합니다.")
+                        self._append_log(text)
+                        self._set_ready(text, "Ok.TLabel", True)
+                    else:
+                        self.status_var.set("CCI 변환에 실패했어요. 진행 기록을 확인해 주세요.")
+                        self._show_log()
+                        messagebox.showerror("CCI 변환 실패", event[2])
                 elif kind == "done":
                     ok = event[1]
                     if ok:
