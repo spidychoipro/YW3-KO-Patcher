@@ -62,11 +62,13 @@
 
 ### 실기(3DS 본체)에서 쓰기
 
-앱이 본편 CIA를 같이 만들어 주므로 GodMode9 변환 없이 바로 설치할 수 있습니다.
+앱이 만드는 CIA는 내용이 평문이라 Azahar에서는 그대로 설치되지만, 실기에서는 암호화가 필요합니다. FBI가 `0xD8E0806A`(`Cert signature or hash check failed`)를 뱉으면 평문 CIA를 그대로 설치하려고 한 겁니다.
 
-1. `YW3_Sukiyaki_KO_base.cia`와 `YW3_Sukiyaki_KO_update4.cia`를 SD 카드에 넣습니다.
-2. FBI를 실행해 두 파일을 설치합니다. 원본 본편이 이미 들어 있다면 FBI에서 기존 본편 타이틀을 먼저 지우고 설치하세요. 업데이트는 그대로 둬도 됩니다.
-3. 홈메뉴에서 게임을 실행합니다.
+1. `YW3_Sukiyaki_KO_base.cia`와 `YW3_Sukiyaki_KO_update4.cia`를 SD 카드의 `/cias`에 넣습니다.
+2. 3DS 전원을 끄고 `START`를 누른 채 켜서 GodMode9을 실행합니다.
+3. 각 CIA를 고르고 **CIA image options → Encrypt file → Encrypt to 0:/gm9/out** 을 누릅니다. 본편은 암호화된 출력본을 만들려면 SD 여유 공간이 3.5GB 이상 필요합니다. 공간이 부족하면 `Encryption failed`가 뜨므로, 이때는 **Encrypt inplace**를 쓰거나 다른 파일을 지워 공간을 확보하세요.
+4. FBI로 `/gm9/out`의 암호화된 두 파일을 설치합니다. 원본 본편이 이미 들어 있다면 FBI에서 기존 본편 타이틀을 먼저 지우고 설치하세요. 업데이트는 그대로 둬도 됩니다.
+5. 홈메뉴에서 게임을 실행합니다.
 
 카트리지 원본으로 게임을 실행해도 설치한 업데이트가 적용됩니다. 본편 CIA와 업데이트 CIA 둘 다 들어가 있어야 한글이 나옵니다.
 
