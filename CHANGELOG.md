@@ -4,6 +4,10 @@
 
 한글 패치 버전(v1.01)과 앱 버전은 따로 간다.
 
+## v1.7.8 · 자동 업데이트 중 DLL 오류 수정
+
+- 앱 안에서 업데이트를 누르면 `Failed to load Python DLL ... python315.dll` 창이 먼저 뜨고, 확인을 누르면 새 버전이 열리는 문제가 있었다. PyInstaller가 updater에 `_PYI_APPLICATION_HOME_DIR`, `_MEIPASS2` 같은 환경변수를 물려줘서, 새 exe가 이미 사라진 `_MEI...` 임시 폴더에서 DLL을 찾으려던 게 원인이다. updater를 띄울 때와 updater가 새 exe를 실행할 때 이 변수들을 지우도록 고쳤다. (#45, PR #46)
+
 ## v1.7.7 · 실기 CIA에 홈메뉴 아이콘을 넣음
 
 - 앱이 만든 CIA에는 meta 영역(SMDH)이 없어서, 실기에서 설치하고 홈메뉴로 돌아오면 `0xc8804464` ErrDisp가 뜨고 menu 프로세스가 죽었다. CCI의 ExeFS에서 icon(SMDH)을 읽어 CIA meta에 넣도록 고쳤다. (#43, PR #44)

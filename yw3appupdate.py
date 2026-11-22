@@ -24,6 +24,17 @@ MAX_ASSET_SIZE = 200 * 1024 * 1024
 CREATE_NO_WINDOW = 0x08000000
 HASH_BLOCK = 8 * 1024 * 1024
 
+# PyInstaller onefile 부트로더가 자식 프로세스에 물려주는 환경변수.
+# 이게 남아 있으면 새 exe가 이미 지워진 _MEI... 임시 폴더에서 python DLL을
+# 찾으려다 "Failed to load Python DLL" 창을 띄운다. updater와 그 자식에서
+# 모두 지워야 한다.
+PYI_ENV_VARS = (
+    "_PYI_ARCHIVE_FILE",
+    "_PYI_APPLICATION_HOME_DIR",
+    "_PYI_PARENT_PROCESS_LEVEL",
+    "_MEIPASS2",
+)
+
 VERSION_RE = re.compile(r"v?(\d+(?:\.\d+){1,3})")
 HEX_RE = re.compile(r"[0-9a-f]{64}")
 URL_PREFIX = f"/{APP_REPO}/releases/download/"
@@ -189,6 +200,9 @@ UPDATER_SCRIPT = r'''param(
     [string]$Log
 )
 $ErrorActionPreference = 'Stop'
+foreach ($name in @('_PYI_ARCHIVE_FILE', '_PYI_APPLICATION_HOME_DIR', '_PYI_PARENT_PROCESS_LEVEL', '_MEIPASS2')) {
+    Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+}
 function Write-UpdaterLog([string]$Message) {
     if (-not $Log) { return }
     $line = "{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
@@ -253,6 +267,9 @@ def launch_updater(cache: Path, target: Path, source: Path, release: AppRelease,
         "-ReleaseUrl", release.page,
         "-Log", str(log_path),
     ]
+    env = os.environ.copy()
+    for name in PYI_ENV_VARS:
+        env.pop(name, None)
     # DETACHED_PROCESS를 같이 쓰면 PowerShell이 조용히 종료되는 경우가 있어
     # CREATE_NO_WINDOW만 쓴다. 부모가 끝나도 자식 프로세스는 그대로 남는다.
-    return subprocess.Popen(args, creationflags=CREATE_NO_WINDOW, close_fds=True)
+    return subprocess.Popen(args, creationflags=CREATE_NO_WINDOW, close_fds=True, env=env)
