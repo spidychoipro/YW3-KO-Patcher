@@ -51,6 +51,8 @@ class CciToCiaTest(unittest.TestCase):
             self.assertTrue(any(info.ticket[ticket_sig + 0x7F:ticket_sig + 0x8F]))
 
             sig = converter._sig_data_size(int.from_bytes(info.tmd[0:4], "big"))
+            self.assertEqual(info.tmd[sig + 0xA4:sig + 0xC4],
+                             hashlib.sha256(info.tmd[sig + 0xC4:sig + 0x9C4]).digest())
             records = info.tmd[sig + 0xC4 + 64 * 0x24:]
             with cia.open("rb") as handle:
                 for item in info.contents:
@@ -59,6 +61,35 @@ class CciToCiaTest(unittest.TestCase):
                     record = records[item.index * 0x30:(item.index + 1) * 0x30]
                     self.assertEqual(hashlib.sha256(raw).digest(), record[16:48])
                     self.assertEqual(int.from_bytes(record[8:16], "big"), item.size)
+
+    def test_save_size_and_meta_match_extheader(self):
+        # GodMode9 BuildFakeTmd / BuildCiaMeta: save size is LE32,
+        # dependencies come from SCI+0x40, and metadata core version is 2.
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            head = bytearray(fake_ncch(0x00040000001AF400))
+            head[0x104:0x108] = (5).to_bytes(4, 'little')
+            head[0x180:0x184] = (0x400).to_bytes(4, 'little')
+            exheader = bytearray(0x800)
+            dependencies = bytes(range(256)) + bytes(range(128))
+            exheader[0x40:0x1C0] = dependencies
+            exheader[0x1C0:0x1C8] = (524288).to_bytes(8, 'little')
+            payload = bytes(head) + exheader
+            cci, cia = root / 'test.cci', root / 'test.cia'
+            cci.write_bytes(converter._build_ncsd_header([(bytes(head), len(payload))]) + payload)
+            converter.cci_to_cia(cci, cia, lambda _: None)
+            info = converter.read_cia(cia)
+            body = converter._sig_data_size(int.from_bytes(info.tmd[:4], 'big'))
+            self.assertEqual(int.from_bytes(info.tmd[body + 0x5A:body + 0x5E], 'little'), 524288)
+            with cia.open('rb') as stream:
+                stream.seek(converter._align(info.content_area + sum(x.size for x in info.contents), 64))
+                meta = stream.read(converter.CIA_META_SIZE)
+            self.assertEqual(meta[:0x180], dependencies)
+            self.assertEqual(int.from_bytes(meta[0x300:0x304], 'little'), 2)
+            with cci.open('rb') as stream, cia.open('rb') as installed:
+                stream.seek(converter.CCI_HEADER_SIZE)
+                installed.seek(info.contents[0].offset)
+                self.assertEqual(stream.read(), installed.read(len(payload)))
 
 
     def test_cia_carries_smdh_meta_for_home_menu(self):
