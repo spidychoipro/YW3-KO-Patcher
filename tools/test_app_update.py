@@ -1,5 +1,6 @@
 """앱 자체 업데이트 확인, 검증, 설치 손잡이 회귀 테스트."""
 import hashlib
+import os
 import sys
 import tempfile
 import time
@@ -124,6 +125,30 @@ class AppUpdateTests(unittest.TestCase):
             flags = popen.call_args.kwargs['creationflags']
             self.assertTrue(flags & appupdate.CREATE_NO_WINDOW)
             self.assertFalse(flags & getattr(appupdate.subprocess, 'DETACHED_PROCESS', 0))
+
+    def test_updater_drops_pyinstaller_bootstrap_env(self):
+        release = appupdate.parse_release(release_data())
+        injected = {
+            '_PYI_ARCHIVE_FILE': r'C:\Temp\_MEIold\base_library.zip',
+            '_PYI_APPLICATION_HOME_DIR': r'C:\Temp\_MEIold',
+            '_PYI_PARENT_PROCESS_LEVEL': '1',
+            '_MEIPASS2': r'C:\Temp\_MEIold',
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder)
+            with patch.dict(os.environ, injected), \
+                    patch.object(appupdate, 'can_self_update', return_value=True), \
+                    patch.object(appupdate.subprocess, 'Popen') as popen:
+                appupdate.launch_updater(
+                    cache, Path(r'C:\Apps\YW3-KO-Patcher.exe'),
+                    cache / 'new.exe', release, parent_pid=4321)
+            env = popen.call_args.kwargs['env']
+            for name in injected:
+                self.assertNotIn(name, env, f'{name}이 updater로 넘어갔습니다')
+            self.assertEqual(env.get('PATH'), os.environ.get('PATH'))
+            script_text = (cache / 'app-updates' / 'updater.ps1').read_text(encoding='utf-8')
+            for name in injected:
+                self.assertIn(name, script_text, f'updater 스크립트에 {name} 정리가 없습니다')
 
     def test_gui_has_update_button_and_manual_check(self):
         gui = app.PatcherApp()

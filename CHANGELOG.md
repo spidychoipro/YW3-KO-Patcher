@@ -4,12 +4,13 @@
 
 한글 패치 버전(v1.01)과 앱 버전은 따로 간다.
 
-## v1.7.8 · 본편 CIA의 검증값과 세이브 메타데이터 수정
+## v1.7.8 · CIA 검증값 수정과 자동 업데이트 오류 수정
 
 - CCI→CIA 변환에서 TMD content-info 최상위 SHA-256을 다시 계산합니다. 기존 본편 CIA는 CTRTool에서 `TMD had invalid CMD group hash`로 거부됐습니다.
 - 확장 헤더에서 읽은 세이브 크기(실제 본편 512KB)를 TMD에 기록하고, CIA 메타에 의존성 목록과 core_version=2를 넣습니다. GodMode9 생성 규칙과 대조했습니다.
 - 본편 게임 데이터는 변경하지 않습니다. 회귀 검사와 실제 파일 검증을 수행했으며 실기 부팅은 재확인이 필요합니다. (#43)
 - 실기에서는 무조건 암호화해야 한다거나 아이콘/DB 손상이 원인이라는 기존 설명을 정정합니다.
+- 앱 안에서 업데이트를 누르면 `Failed to load Python DLL ... python315.dll` 창이 먼저 뜨고, 확인을 누르면 새 버전이 열리는 문제가 있었다. PyInstaller가 updater에 `_PYI_APPLICATION_HOME_DIR`, `_MEIPASS2` 같은 환경변수를 물려줘서, 새 exe가 이미 사라진 `_MEI...` 임시 폴더에서 DLL을 찾으려던 게 원인이다. updater를 띄울 때와 updater가 새 exe를 실행할 때 이 변수들을 지우도록 고쳤다. (#45, PR #46)
 
 ## v1.7.7 · 실기 CIA에 홈메뉴 아이콘을 넣음
 
